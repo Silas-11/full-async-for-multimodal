@@ -36,6 +36,7 @@ from verl.utils.fsdp_utils import (
 from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
 from .checkpoint_engine import CheckpointEngine
+from .distributed_util import stateless_init_process_group
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -82,6 +83,13 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset: int, world_size: int):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = stateless_init_process_group(
+            master_address, master_port, rank, world_size, get_torch_device().current_device()
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self, sync_group_name="actor_rollout"):
         assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
@@ -104,9 +112,10 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
                     origin_data = origin_data.full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
-            from ray.util.collective import collective
+            # from ray.util.collective import collective
 
-            collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            # collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            self._weight_sync_group.bradcast(tensor, src=0, stream=get_torch_device().current_stream())
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
