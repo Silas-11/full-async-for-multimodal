@@ -52,6 +52,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
     ) -> tuple[list[Any], list[Any], Any] | tuple[Sequence[int], list[float], bool]:
         """Generate tokens from prompt ids, used for async partial.
 
@@ -72,6 +73,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            video_data=video_data,
         )
         return output
 
