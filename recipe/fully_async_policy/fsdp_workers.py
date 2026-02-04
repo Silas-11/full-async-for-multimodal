@@ -115,7 +115,7 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
             # from ray.util.collective import collective
 
             # collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
-            self._weight_sync_group.bradcast(tensor, src=0, stream=get_torch_device().current_stream())
+            self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
