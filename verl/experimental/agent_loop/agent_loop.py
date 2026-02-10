@@ -17,7 +17,6 @@ import logging
 import math
 import os
 import random
-import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -57,41 +56,30 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 class _ActorLoadEntry:
     """
-    Per-actor load tracking entry used by the EWMA-based scheduler.
+    Per-actor load tracking entry for Fully-Async scheduling.
 
-    Each entry maintains a time-decayed load score that represents
-    the recent pressure on the actor.
+    Each entry maintains the historical cumulative load of all
+    requests previously dispatched to this actor.
     """
 
-    __slots__ = ("actor", "idx", "load", "last_ts")
+    __slots__ = ("actor", "idx", "load")
 
     def __init__(self, actor: ray.actor.ActorHandle, idx: int):
         self.actor = actor
         self.idx = idx
-        self.load: float = 0.0  # EWMA load score
-        self.last_ts: float = time.time()
-
-    def decay(self, now: float, tau: float):
-        """
-        Apply exponential decay to the load score.
-
-        load(t) = load(t0) * exp(-(t - t0) / tau)
-        """
-        dt = now - self.last_ts
-        if dt > 0:
-            self.load *= math.exp(-dt / tau)
-            self.last_ts = now
+        self.load: float = 0.0  # cumulative estimated load
 
 
 class AsyncLLMServerManager:
     """
-    Asynchronous vLLM server manager with EWMA-based load balancing.
+    Asynchronous vLLM server manager with fully-async load balancing
+    based on historical cumulative request weight + sticky session.
 
     Design goals:
-    1. Dynamically adapt to load changes and mitigate long-tail requests
-    2. O(log N) actor selection via a min-heap
-    3. No request-completion callbacks or monitor threads
-    4. Sticky session support for KV cache reuse
+    1. Use historical request weight as a proxy for actor load
+    2. Sticky session support for KV cache reuse
+    3. O(log N) actor selection via a min-heap
+    4. No EWMA, no decay, no active_tasks required
     """
 
     def __init__(
@@ -99,27 +87,9 @@ class AsyncLLMServerManager:
         config: Any,
         server_handles: list[ray.actor.ActorHandle],
         *,
-        tau: float = 3.0,
         max_cache_size: int = 10_000,
     ):
-        """
-        Args:
-            config:
-                Global configuration object (kept for compatibility).
-            server_handles:
-                List of Ray ActorHandles, each corresponding to a vLLM server replica.
-            tau:
-                Time constant (seconds) for EWMA decay.
-                Typical values:
-                  - Short requests / high concurrency: 1 ~ 2
-                  - Long generation / RL rollout: 3 ~ 5
-            max_cache_size:
-                Maximum size of the sticky-session LRU cache.
-        """
-        assert tau > 0, "tau must be positive"
-
         self.config = config
-        self.tau = tau
 
         # Shuffle to avoid initial routing bias
         self.server_handles = list(server_handles)
@@ -140,61 +110,27 @@ class AsyncLLMServerManager:
         heapq.heapify(self._heap)
 
     def _analyze_prompt_ids(self, prompt_ids) -> tuple[int, int]:
-        """
-        Normalize prompt_ids shape and return:
-        - total_tokens: total number of prompt tokens
-        - num_seqs: number of sequences
-
-        Supported shapes:
-        - List[int]
-        - List[List[int]]
-        """
         if not prompt_ids:
             return 0, 0
-
         first = prompt_ids[0]
-
-        # Case 1: List[int]
         if isinstance(first, int):
             return len(prompt_ids), 1
-
-        # Case 2: List[List[int]]
         if isinstance(first, list):
-            total_tokens = 0
-            for p in prompt_ids:
-                total_tokens += len(p)
+            total_tokens = sum(len(p) for p in prompt_ids)
             return total_tokens, len(prompt_ids)
-
-        raise TypeError(
-            f"Unsupported prompt_ids type: expected List[int] or List[List[int]], but got element type {type(first)}"
-        )
+        raise TypeError(f"Unsupported prompt_ids type: {type(first)}")
 
     def _estimate_request_weight(self, prompt_ids) -> float:
-        """
-        Estimate relative request pressure from prompt token volume.
-
-        Uses log-scaled total prompt tokens to approximate request cost.
-        """
         total_tokens, _ = self._analyze_prompt_ids(prompt_ids)
+        return math.log2(total_tokens + 1.0) if total_tokens > 0 else 0.0
 
-        if total_tokens == 0:
-            return 0.0
-
-        # Log-scaled pressure (monotonic, numerically stable)
-        return math.log2(total_tokens + 1.0)
-
-    def _choose_server(
-        self,
-        request_id: str,
-        *,
-        prompt_ids,
-    ) -> ray.actor.ActorHandle:
+    def _choose_server(self, request_id: str, *, prompt_ids) -> ray.actor.ActorHandle:
         """
         Select a vLLM server for the given request.
 
         Priority:
         1. Sticky session
-        2. EWMA-based load balancing
+        2. Least cumulative load
         """
 
         # 1. Sticky session
@@ -203,23 +139,16 @@ class AsyncLLMServerManager:
             print(f"[scheduler][sticky] req={request_id} -> actor={entry.idx} load={entry.load:.3f}")
             return entry.actor
 
-        # 2. Choose the least-loaded actor
-        now = time.time()
+        # 2. Choose the least cumulative load actor
         _, _, entry = heapq.heappop(self._heap)
 
-        before_decay = entry.load
-        entry.decay(now, self.tau)
-        after_decay = entry.load
-
-        # Analyze prompt
-        total_tokens, num_seqs = self._analyze_prompt_ids(prompt_ids)
-
-        # Estimate request pressure
+        # Estimate request weight
         weight = self._estimate_request_weight(prompt_ids)
 
         # Apply load increment
+        before_load = entry.load
         entry.load += weight
-        after_update = entry.load
+        after_load = entry.load
 
         # Push back to heap
         heapq.heappush(self._heap, (entry.load, entry.idx, entry))
@@ -227,13 +156,9 @@ class AsyncLLMServerManager:
         # Record sticky mapping
         self.request_id_to_actor[request_id] = entry
 
-        # ---- Print scheduling decision ----
         print(
-            f"[scheduler] "
-            f"req={request_id} "
-            f"seqs={num_seqs} tokens={total_tokens} weight={weight:.3f} | "
-            f"actor={entry.idx} "
-            f"load {before_decay:.3f} -> {after_decay:.3f} -> {after_update:.3f}"
+            f"[scheduler] req={request_id} weight={weight:.3f} | "
+            f"actor={entry.idx} load {before_load:.3f} -> {after_load:.3f}"
         )
 
         return entry.actor
