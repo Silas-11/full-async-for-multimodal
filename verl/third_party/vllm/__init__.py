@@ -29,6 +29,7 @@ def get_version(pkg):
 
 package_name = "vllm"
 package_version = get_version(package_name)
+package_version = "0.11.0"
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
 

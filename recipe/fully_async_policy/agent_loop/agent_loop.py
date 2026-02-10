@@ -67,7 +67,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             - Element 1 (list[float]): Log probabilities for the response token IDs.
             - Element 2 (bool): A flag or status indicating cancellation.
         """
-        server = self._choose_server(request_id)
+        server = self._choose_server(request_id, prompt_ids=prompt_ids)
         output = await server.generate_for_partial.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,

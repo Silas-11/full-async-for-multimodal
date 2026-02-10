@@ -14,8 +14,10 @@
 import asyncio
 import heapq
 import logging
+import math
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -45,81 +47,235 @@ from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
-    rollout_trace_op,
 )
 from verl.utils.transferqueue_utils import tqbridge
-from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.replica import get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+class _ActorLoadEntry:
+    """
+    Per-actor load tracking entry used by the EWMA-based scheduler.
+
+    Each entry maintains a time-decayed load score that represents
+    the recent pressure on the actor.
+    """
+
+    __slots__ = ("actor", "idx", "load", "last_ts")
+
+    def __init__(self, actor: ray.actor.ActorHandle, idx: int):
+        self.actor = actor
+        self.idx = idx
+        self.load: float = 0.0  # EWMA load score
+        self.last_ts: float = time.time()
+
+    def decay(self, now: float, tau: float):
+        """
+        Apply exponential decay to the load score.
+
+        load(t) = load(t0) * exp(-(t - t0) / tau)
+        """
+        dt = now - self.last_ts
+        if dt > 0:
+            self.load *= math.exp(-dt / tau)
+            self.last_ts = now
+
+
 class AsyncLLMServerManager:
     """
-    A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least requests load balancing
-    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    Asynchronous vLLM server manager with EWMA-based load balancing.
+
+    Design goals:
+    1. Dynamically adapt to load changes and mitigate long-tail requests
+    2. O(log N) actor selection via a min-heap
+    3. No request-completion callbacks or monitor threads
+    4. Sticky session support for KV cache reuse
     """
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
-        """Initialize the AsyncLLMServerManager.
-
-        Args:
-            config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-            max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
+    def __init__(
+        self,
+        config: Any,
+        server_handles: list[ray.actor.ActorHandle],
+        *,
+        tau: float = 3.0,
+        max_cache_size: int = 10_000,
+    ):
         """
+        Args:
+            config:
+                Global configuration object (kept for compatibility).
+            server_handles:
+                List of Ray ActorHandles, each corresponding to a vLLM server replica.
+            tau:
+                Time constant (seconds) for EWMA decay.
+                Typical values:
+                  - Short requests / high concurrency: 1 ~ 2
+                  - Long generation / RL rollout: 3 ~ 5
+            max_cache_size:
+                Maximum size of the sticky-session LRU cache.
+        """
+        assert tau > 0, "tau must be positive"
+
         self.config = config
-        self.server_handles = server_handles
+        self.tau = tau
+
+        # Shuffle to avoid initial routing bias
+        self.server_handles = list(server_handles)
         random.shuffle(self.server_handles)
 
-        # Least requests load balancing
-        self.weighted_serveres = [[0, idx, server] for idx, server in enumerate(self.server_handles)]
-        heapq.heapify(self.weighted_serveres)
+        # Sticky session mapping: request_id -> _ActorLoadEntry
+        self.request_id_to_actor: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
 
-        # LRU cache to map request_id to server
-        self.request_id_to_server = LRUCache(maxsize=max_cache_size)
+        # Min-heap ordered by (load, idx)
+        self._heap: list[tuple[float, int, _ActorLoadEntry]] = []
+        self._entries: list[_ActorLoadEntry] = []
 
-    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
-        if request_id in self.request_id_to_server:
-            return self.request_id_to_server[request_id]
+        for idx, actor in enumerate(self.server_handles):
+            entry = _ActorLoadEntry(actor, idx)
+            self._entries.append(entry)
+            self._heap.append((entry.load, idx, entry))
 
-        _, _, server = self.weighted_serveres[0]
-        self.weighted_serveres[0][0] += 1
-        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
-        self.request_id_to_server[request_id] = server
-        return server
+        heapq.heapify(self._heap)
 
-    @rollout_trace_op
+    def _analyze_prompt_ids(self, prompt_ids) -> tuple[int, int]:
+        """
+        Normalize prompt_ids shape and return:
+        - total_tokens: total number of prompt tokens
+        - num_seqs: number of sequences
+
+        Supported shapes:
+        - List[int]
+        - List[List[int]]
+        """
+        if not prompt_ids:
+            return 0, 0
+
+        first = prompt_ids[0]
+
+        # Case 1: List[int]
+        if isinstance(first, int):
+            return len(prompt_ids), 1
+
+        # Case 2: List[List[int]]
+        if isinstance(first, list):
+            total_tokens = 0
+            for p in prompt_ids:
+                total_tokens += len(p)
+            return total_tokens, len(prompt_ids)
+
+        raise TypeError(
+            f"Unsupported prompt_ids type: expected List[int] or List[List[int]], but got element type {type(first)}"
+        )
+
+    def _estimate_request_weight(self, prompt_ids) -> float:
+        """
+        Estimate relative request pressure from prompt token volume.
+
+        Uses log-scaled total prompt tokens to approximate request cost.
+        """
+        total_tokens, _ = self._analyze_prompt_ids(prompt_ids)
+
+        if total_tokens == 0:
+            return 0.0
+
+        # Log-scaled pressure (monotonic, numerically stable)
+        return math.log2(total_tokens + 1.0)
+
+    def _choose_server(
+        self,
+        request_id: str,
+        *,
+        prompt_ids,
+    ) -> ray.actor.ActorHandle:
+        """
+        Select a vLLM server for the given request.
+
+        Priority:
+        1. Sticky session
+        2. EWMA-based load balancing
+        """
+
+        # 1. Sticky session
+        entry = self.request_id_to_actor.get(request_id)
+        if entry is not None:
+            print(f"[scheduler][sticky] req={request_id} -> actor={entry.idx} load={entry.load:.3f}")
+            return entry.actor
+
+        # 2. Choose the least-loaded actor
+        now = time.time()
+        _, _, entry = heapq.heappop(self._heap)
+
+        before_decay = entry.load
+        entry.decay(now, self.tau)
+        after_decay = entry.load
+
+        # Analyze prompt
+        total_tokens, num_seqs = self._analyze_prompt_ids(prompt_ids)
+
+        # Estimate request pressure
+        weight = self._estimate_request_weight(prompt_ids)
+
+        # Apply load increment
+        entry.load += weight
+        after_update = entry.load
+
+        # Push back to heap
+        heapq.heappush(self._heap, (entry.load, entry.idx, entry))
+
+        # Record sticky mapping
+        self.request_id_to_actor[request_id] = entry
+
+        # ---- Print scheduling decision ----
+        print(
+            f"[scheduler] "
+            f"req={request_id} "
+            f"seqs={num_seqs} tokens={total_tokens} weight={weight:.3f} | "
+            f"actor={entry.idx} "
+            f"load {before_decay:.3f} -> {after_decay:.3f} -> {after_update:.3f}"
+        )
+
+        return entry.actor
+
+    # ------------------------------------------------------------------
+    # Public async generation API
+    # ------------------------------------------------------------------
+
     async def generate(
         self,
-        request_id,
+        request_id: str,
         *,
-        prompt_ids: list[int],
+        prompt_ids: list[list[int]],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
-    ) -> TokenOutput:
-        """Generate tokens from prompt ids.
-
-        Args:
-            request_id (str): request id for sticky session.
-            prompt_ids (List[int]): List of prompt token ids.
-            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
-
-        Returns:
-            TokenOutput: token output
+    ):
         """
-        server = self._choose_server(request_id)
-        output = await server.generate.remote(
-            request_id=uuid4().hex,  # use new request_id for each turn
+        Asynchronous token generation API.
+
+        This method:
+        1. Selects a server via sticky session + EWMA load balancing
+        2. Issues a non-blocking Ray remote call to the vLLM server
+        3. Returns the generation result directly
+
+        Note:
+        No explicit load decrement is required. The EWMA load
+        naturally decays over time, allowing short requests to
+        release pressure automatically.
+        """
+        server = self._choose_server(
+            request_id,
+            prompt_ids=prompt_ids,
+        )
+
+        return await server.generate.remote(
+            request_id=uuid4().hex,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
         )
-        return output
 
 
 class AgentLoopMetrics(BaseModel):
