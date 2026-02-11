@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -54,32 +55,48 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# ===============================
+# Per-actor load entry
+# ===============================
+
+
 class _ActorLoadEntry:
     """
-    Per-actor load tracking entry for Fully-Async scheduling.
-
-    Each entry maintains the historical cumulative load of all
-    requests previously dispatched to this actor.
+    Per-actor EWMA load tracker.
     """
 
-    __slots__ = ("actor", "idx", "load")
+    __slots__ = ("actor", "idx", "load", "last_ts")
 
     def __init__(self, actor: ray.actor.ActorHandle, idx: int):
         self.actor = actor
         self.idx = idx
-        self.load: float = 0.0  # cumulative estimated load
+        self.load: float = 0.0
+        self.last_ts: float = time.time()
+
+    def decay(self, now: float, tau: float):
+        """
+        Exponential decay:
+            load(t) = load(t0) * exp(-(t - t0) / tau)
+        """
+        dt = now - self.last_ts
+        if dt > 0:
+            self.load *= math.exp(-dt / tau)
+            self.last_ts = now
+
+
+# ===============================
+# Async LLM Server Manager
+# ===============================
 
 
 class AsyncLLMServerManager:
     """
-    Asynchronous vLLM server manager with fully-async load balancing
-    based on historical cumulative request weight + sticky session.
+    Fully async vLLM server manager with:
 
-    Design goals:
-    1. Use historical request weight as a proxy for actor load
-    2. Sticky session support for KV cache reuse
-    3. O(log N) actor selection via a min-heap
-    4. No EWMA, no decay, no active_tasks required
+    - Strict EWMA load modeling
+    - Prompt-aware weight estimation
+    - Sticky session support
+    - O(N) decay (acceptable for small N)
     """
 
     def __init__(
@@ -87,68 +104,127 @@ class AsyncLLMServerManager:
         config: Any,
         server_handles: list[ray.actor.ActorHandle],
         *,
+        tau: float = 3.0,
         max_cache_size: int = 10_000,
     ):
-        self.config = config
+        assert tau > 0, "tau must be positive"
 
-        # Shuffle to avoid initial routing bias
+        self.config = config
+        self.tau = tau
+
         self.server_handles = list(server_handles)
         random.shuffle(self.server_handles)
 
-        # Sticky session mapping: request_id -> _ActorLoadEntry
+        # Sticky mapping: request_id -> _ActorLoadEntry
         self.request_id_to_actor: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
 
-        # Min-heap ordered by (load, idx)
-        self._heap: list[tuple[float, int, _ActorLoadEntry]] = []
+        # Actor entries
         self._entries: list[_ActorLoadEntry] = []
+        self._heap: list[tuple[float, int, _ActorLoadEntry]] = []
 
         for idx, actor in enumerate(self.server_handles):
             entry = _ActorLoadEntry(actor, idx)
             self._entries.append(entry)
-            self._heap.append((entry.load, idx, entry))
+            self._heap.append((entry.load, entry.idx, entry))
 
         heapq.heapify(self._heap)
 
+    # ======================================
+    # Prompt analysis
+    # ======================================
+
     def _analyze_prompt_ids(self, prompt_ids) -> tuple[int, int]:
+        """
+        Return:
+            total_tokens
+            num_sequences
+        """
+
         if not prompt_ids:
             return 0, 0
+
         first = prompt_ids[0]
+
+        # Case 1: List[int]
         if isinstance(first, int):
             return len(prompt_ids), 1
+
+        # Case 2: List[List[int]]
         if isinstance(first, list):
             total_tokens = sum(len(p) for p in prompt_ids)
             return total_tokens, len(prompt_ids)
-        raise TypeError(f"Unsupported prompt_ids type: {type(first)}")
+
+        raise TypeError(f"Unsupported prompt_ids type: got {type(first)}")
 
     def _estimate_request_weight(self, prompt_ids) -> float:
+        """
+        Prompt-aware weight:
+
+            weight = log2(total_tokens + 1)
+
+        Log scaling prevents extreme dominance by long prompts.
+        """
+
         total_tokens, _ = self._analyze_prompt_ids(prompt_ids)
-        return math.log2(total_tokens + 1.0) if total_tokens > 0 else 0.0
 
-    def _choose_server(self, request_id: str, *, prompt_ids) -> ray.actor.ActorHandle:
+        if total_tokens <= 0:
+            return 0.0
+
+        return math.log2(total_tokens + 1.0)
+
+    # ======================================
+    # Core scheduler
+    # ======================================
+
+    def _choose_server(
+        self,
+        request_id: str,
+        *,
+        prompt_ids,
+    ) -> ray.actor.ActorHandle:
         """
-        Select a vLLM server for the given request.
+        Strict EWMA scheduling:
 
-        Priority:
-        1. Sticky session
-        2. Least cumulative load
+        1. Sticky check
+        2. Full decay for all actors
+        3. Pick minimal load
+        4. Inject new weight
         """
 
+        # ------------------------------
         # 1. Sticky session
+        # ------------------------------
         entry = self.request_id_to_actor.get(request_id)
         if entry is not None:
-            print(f"[scheduler][sticky] req={request_id} -> actor={entry.idx} load={entry.load:.3f}")
+            print(f"[scheduler][sticky] req={request_id} -> actor={entry.idx} load={entry.load:.4f}")
             return entry.actor
 
-        # 2. Choose the least cumulative load actor
+        now = time.time()
+
+        # ------------------------------
+        # 2. Full decay for ALL actors
+        # ------------------------------
+        for e in self._entries:
+            e.decay(now, self.tau)
+
+        # Rebuild heap (loads changed)
+        self._heap = [(e.load, e.idx, e) for e in self._entries]
+        heapq.heapify(self._heap)
+
+        # ------------------------------
+        # 3. Pick minimal load actor
+        # ------------------------------
         _, _, entry = heapq.heappop(self._heap)
 
-        # Estimate request weight
+        # ------------------------------
+        # 4. Prompt-aware weight
+        # ------------------------------
+        total_tokens, num_seqs = self._analyze_prompt_ids(prompt_ids)
         weight = self._estimate_request_weight(prompt_ids)
 
-        # Apply load increment
-        before_load = entry.load
+        before = entry.load
         entry.load += weight
-        after_load = entry.load
+        after = entry.load
 
         # Push back to heap
         heapq.heappush(self._heap, (entry.load, entry.idx, entry))
@@ -157,8 +233,13 @@ class AsyncLLMServerManager:
         self.request_id_to_actor[request_id] = entry
 
         print(
-            f"[scheduler] req={request_id} weight={weight:.3f} | "
-            f"actor={entry.idx} load {before_load:.3f} -> {after_load:.3f}"
+            f"[scheduler] "
+            f"req={request_id} "
+            f"seqs={num_seqs} "
+            f"tokens={total_tokens} "
+            f"weight={weight:.3f} | "
+            f"actor={entry.idx} "
+            f"load {before:.4f} -> {after:.4f}"
         )
 
         return entry.actor
