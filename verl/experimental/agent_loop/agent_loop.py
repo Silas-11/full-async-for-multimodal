@@ -164,6 +164,7 @@ class AsyncLLMServerManager:
         weight = self._estimate_prompt_weight(prompt_ids)
 
         async with self._lock:
+            self._log_status_unsafe()
             # 1. 粘性会话检查
             sticky_entry = self.request_id_to_entry.get(request_id)
             if sticky_entry is not None:
@@ -237,6 +238,20 @@ class AsyncLLMServerManager:
                 entry.inflight_requests = max(0, entry.inflight_requests - 1)
                 entry.running_weight = max(0.0, entry.running_weight - weight)
                 entry.update_latency(latency)
+
+    def _log_status_unsafe(self):
+        """直接打印状态，不加锁，由调用方保证线程安全"""
+        status_lines = []
+        for e in self._entries:
+            status_lines.append(
+                f"[Server {e.idx}] "
+                f"inflight={e.inflight_requests} "
+                f"weight={e.running_weight:.2f} "
+                f"load={e.effective_load():.2f} "
+                f"latency={e.avg_latency:.3f}s"
+            )
+        # 一次性打印，减少 I/O 次数
+        logger.info("=== Load Balance Snapshot ===\n" + "\n".join(status_lines))
 
     # ======================================================
     # 调试接口
