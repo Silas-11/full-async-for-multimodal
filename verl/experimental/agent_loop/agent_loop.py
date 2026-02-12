@@ -55,7 +55,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 # ==============================================
-# Per-actor runtime load entry (V6 Final)
+# Per-actor runtime load entry (V7 Optimized)
 # ==============================================
 class _ActorLoadEntry:
     """
@@ -72,7 +72,7 @@ class _ActorLoadEntry:
         "finished_count",
     )
 
-    def __init__(self, actor: ray.actor.ActorHandle, idx: int, max_concurrency: int):
+    def __init__(self, actor, idx: int, max_concurrency: int):
         self.actor = actor
         self.idx = idx
         self.inflight_requests: int = 0
@@ -81,37 +81,56 @@ class _ActorLoadEntry:
         self.avg_latency: float = 0.0
         self.finished_count: int = 0
 
-    def effective_load(self) -> float:
-        # 综合负载 = 请求数 + 权重
-        # 注意：这里隐式地给请求数赋予了 1.0 的基础权重
-        return self.inflight_requests + self.running_weight
+    def effective_load(self, baseline_latency: float = 1.0) -> float:
+        """
+        计算综合负载（含性能惩罚）
+        
+        Args:
+            baseline_latency: 集群当前的基准延迟（通常取最小值或P50）
+        
+        Returns:
+            调整后的负载值。慢节点的负载会被放大。
+        """
+        # 1. 基础负载：排队数 + Token权重
+        base_load = self.inflight_requests + self.running_weight
+        
+        # 2. 性能惩罚因子
+        # 如果 avg_latency > baseline，说明该节点处理能力弱或过载
+        # 如果 avg_latency < baseline (或 baseline=0)，因子为 1.0，不进行负向惩罚
+        if baseline_latency <= 0 or self.avg_latency <= 0:
+            perf_factor = 1.0
+        else:
+            # 慢多少倍，负载就放大多少倍
+            perf_factor = max(1.0, self.avg_latency / baseline_latency)
+        
+        return base_load * perf_factor
 
     def is_available(self) -> bool:
         return self.inflight_requests < self.max_concurrency
 
     def update_latency(self, latency: float):
         self.finished_count += 1
-        # EWMA 移动平均
+        # EWMA 移动平均，平滑历史延迟
         self.avg_latency = 0.9 * self.avg_latency + 0.1 * latency
 
 
 # ==============================================
-# Async LLM Server Manager (V6 Final)
+# Async LLM Server Manager (V7 Final)
 # ==============================================
 class AsyncLLMServerManager:
     """
-    V6 最终优化版
+    V7 最终优化版
 
     改进点：
-    1. 粘性会话严格遵守并发上限，防止 OOM
-    2. 同负载情况下随机选择，防止低负载打向单机
-    3. 简化锁逻辑，确保高性能
+    1. 动态延迟感知：引入 baseline_latency，对慢节点进行负载惩罚
+    2. 粘性会话严格遵守并发上限，防止 OOM
+    3. 同负载情况下随机选择，防止低负载打向单机
     """
 
     def __init__(
         self,
         config: Any,
-        server_handles: list[ray.actor.ActorHandle],
+        server_handles: list,
         *,
         max_concurrency_per_server: int = 32,
         weight_alpha: float = 0.2,
@@ -164,12 +183,13 @@ class AsyncLLMServerManager:
         weight = self._estimate_prompt_weight(prompt_ids)
 
         async with self._lock:
+            # 打印当前状态快照（仅用于调试，生产环境可注释掉或改为采样）
             self._log_status_unsafe()
+
             # 1. 粘性会话检查
             sticky_entry = self.request_id_to_entry.get(request_id)
             if sticky_entry is not None:
                 # 严格检查：只有未满载时才复用粘性会话
-                # 如果允许超载，可将 < 改为 < max * factor
                 if sticky_entry.inflight_requests < sticky_entry.max_concurrency:
                     sticky_entry.inflight_requests += 1
                     sticky_entry.running_weight += weight
@@ -184,15 +204,21 @@ class AsyncLLMServerManager:
 
             if not available_entries:
                 # 全部满载，退化为在所有服务器中选择最小负载
-                # 这是一个软降级，保证请求不被拒绝，但会增加排队延迟
                 available_entries = self._entries
 
-            # 计算最小负载值
-            min_load = min(e.effective_load() for e in available_entries)
+            # --- 关键优化：计算动态基准延迟 ---
+            # 取所有可用节点延迟的最小值作为基准（代表理想性能）
+            valid_latencies = [e.avg_latency for e in available_entries if e.avg_latency > 0]
+            baseline_latency = min(valid_latencies) if valid_latencies else 1.0
+
+            # 计算最小负载值（传入 baseline）
+            min_load = min(e.effective_load(baseline_latency) for e in available_entries)
 
             # 关键优化：找出所有等于最小负载的服务器，随机选择一个
-            # 避免在低负载时请求全部打向列表中的第一个服务器
-            best_entries = [e for e in available_entries if e.effective_load() == min_load]
+            best_entries = [
+                e for e in available_entries 
+                if e.effective_load(baseline_latency) == min_load
+            ]
             chosen_entry = random.choice(best_entries)
 
             # 3. 占位与映射
@@ -209,7 +235,7 @@ class AsyncLLMServerManager:
         self,
         request_id: str,
         *,
-        prompt_ids: list[list[int]],
+        prompt_ids: list,
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
@@ -240,34 +266,33 @@ class AsyncLLMServerManager:
                 entry.update_latency(latency)
 
     def _log_status_unsafe(self):
-        """直接打印状态，不加锁，由调用方保证线程安全"""
+        """打印状态快照，包含延迟惩罚后的负载"""
+        
+        # 计算当前全局基准延迟用于日志显示
+        valid_latencies = [e.avg_latency for e in self._entries if e.avg_latency > 0]
+        baseline = min(valid_latencies) if valid_latencies else 1.0
+
         status_lines = []
         for e in self._entries:
+            # 计算调整后的负载
+            adj_load = e.effective_load(baseline)
+            
             status_lines.append(
                 f"[Server {e.idx}] "
                 f"inflight={e.inflight_requests} "
                 f"weight={e.running_weight:.2f} "
-                f"load={e.effective_load():.2f} "
-                f"latency={e.avg_latency:.3f}s"
+                f"adj_load={adj_load:.2f} "  # 显示调整后的负载
+                f"latency={e.avg_latency:.3f}s "
+                f"(base={baseline:.3f}s)" # 显示当前基准
             )
-        # 一次性打印，减少 I/O 次数
-        logger.info("=== Load Balance Snapshot ===\n" + "\n".join(status_lines))
+        print("=== Load Balance Snapshot ===\n" + "\n".join(status_lines))
 
     # ======================================================
     # 调试接口
     # ======================================================
     async def dump_load_status(self):
         async with self._lock:
-            lines = []
-            for e in self._entries:
-                lines.append(
-                    f"[Server {e.idx}] "
-                    f"inflight={e.inflight_requests} "
-                    f"weight={e.running_weight:.2f} "
-                    f"load={e.effective_load():.2f} "
-                    f"latency={e.avg_latency:.3f}s"
-                )
-            logger.info("\n".join(lines))
+            self._log_status_unsafe()
 
 
 class AgentLoopMetrics(BaseModel):
