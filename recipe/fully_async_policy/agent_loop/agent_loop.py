@@ -461,13 +461,20 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
 # ==============================================
 # Main Entry Point (Environment Variable Control)
 # ==============================================
-# Dynamically select implementation based on environment variable
-if int(os.environ.get("USE_BALANCE_LOAD")):
-    FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
-    print("Initialized FullyAsyncLLMServerManager with FullyAsyncLLMServerManagerBalance")
-else:
-    print("Initialized FullyAsyncLLMServerManager with FullyAsyncLLMServerManager")
+# Dynamically select LLM server manager implementation based on environment variable
+# Handle None/empty values safely with default fallback to 0 (disabled)
+try:
+    use_balance_load = bool(int(os.environ.get("USE_BALANCE_LOAD", "0")))
+except (ValueError, TypeError):
+    logger.warning("Invalid USE_BALANCE_LOAD value, defaulting to base implementation")
+    use_balance_load = False
 
+# Assign the appropriate server manager class
+if use_balance_load:
+    FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
+    logger.info("Using load-balanced FullyAsyncLLMServerManager implementation")
+else:
+    logger.info("Using base FullyAsyncLLMServerManager implementation")
 
 @ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):

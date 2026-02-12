@@ -27,6 +27,7 @@ PPO_RAY_RUNTIME_ENV = {
         "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "TASK_QUEUE_ENABLE": "2",
+        "USE_BALANCE_LOAD": "0",
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
