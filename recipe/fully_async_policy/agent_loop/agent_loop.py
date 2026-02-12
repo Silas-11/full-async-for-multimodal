@@ -462,9 +462,11 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
 # Main Entry Point (Environment Variable Control)
 # ==============================================
 # Dynamically select implementation based on environment variable
-if os.environ.get("USE_BALANCE_LOAD") == "1":
+if os.environ.get("USE_BALANCE_LOAD"):
     FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
     logger.info("Initialized FullyAsyncLLMServerManager with FullyAsyncLLMServerManagerBalance")
+else:
+    logger.info("Initialized FullyAsyncLLMServerManager with FullyAsyncLLMServerManager")
 
 
 @ray.remote
