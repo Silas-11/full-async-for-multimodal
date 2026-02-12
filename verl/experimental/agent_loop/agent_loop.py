@@ -55,7 +55,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 # ==============================================
-# Per-actor runtime load entry (V7 Optimized)
+# Per-actor runtime load entry (V7.1 Final)
 # ==============================================
 class _ActorLoadEntry:
     """
@@ -72,6 +72,10 @@ class _ActorLoadEntry:
         "finished_count",
     )
 
+    # 宽恕因子：允许延迟比基准高出该倍数而不受惩罚
+    # 1.5 表示允许延迟比基准高 50% 而不进行惩罚，兼顾吞吐与稳定性
+    LATENCY_GRACE_FACTOR = 1.5
+
     def __init__(self, actor, idx: int, max_concurrency: int):
         self.actor = actor
         self.idx = idx
@@ -83,27 +87,38 @@ class _ActorLoadEntry:
 
     def effective_load(self, baseline_latency: float = 1.0) -> float:
         """
-        计算综合负载（含性能惩罚）
+        计算综合负载（含性能惩罚 + 宽恕阈值）
+        
+        优化逻辑：
+        1. 计算宽恕上限 (baseline * grace_factor)
+        2. 如果延迟在宽恕范围内，不惩罚（perf_factor = 1.0）
+        3. 如果延迟超出宽恕范围，按比例放大负载
         
         Args:
             baseline_latency: 集群当前的基准延迟（通常取最小值或P50）
         
         Returns:
-            调整后的负载值。慢节点的负载会被放大。
+            调整后的负载值。
         """
         # 1. 基础负载：排队数 + Token权重
         base_load = self.inflight_requests + self.running_weight
         
-        # 2. 性能惩罚因子
-        # 如果 avg_latency > baseline，说明该节点处理能力弱或过载
-        # 如果 avg_latency < baseline (或 baseline=0)，因子为 1.0，不进行负向惩罚
+        # 2. 性能惩罚计算
         if baseline_latency <= 0 or self.avg_latency <= 0:
-            perf_factor = 1.0
+            return base_load
+
+        # 核心优化：计算宽恕上限
+        # 例如：基准 1s，宽恕因子 1.5 -> 只要有 1.5s 以内的延迟都算“正常波动”
+        grace_threshold = baseline_latency * self.LATENCY_GRACE_FACTOR
+
+        if self.avg_latency <= grace_threshold:
+            # 延迟在可接受范围内，不进行惩罚，保持高吞吐
+            return base_load
         else:
+            # 延迟过高（如长请求积压），放大负载权重，引导流量去快节点
             # 慢多少倍，负载就放大多少倍
-            perf_factor = max(1.0, self.avg_latency / baseline_latency)
-        
-        return base_load * perf_factor
+            perf_factor = self.avg_latency / baseline_latency
+            return base_load * perf_factor
 
     def is_available(self) -> bool:
         return self.inflight_requests < self.max_concurrency
@@ -115,16 +130,17 @@ class _ActorLoadEntry:
 
 
 # ==============================================
-# Async LLM Server Manager (V7 Final)
+# Async LLM Server Manager (V7.1 Optimized)
 # ==============================================
 class AsyncLLMServerManager:
     """
-    V7 最终优化版
+    V7.1 最终优化版
 
     改进点：
     1. 动态延迟感知：引入 baseline_latency，对慢节点进行负载惩罚
-    2. 粘性会话严格遵守并发上限，防止 OOM
-    3. 同负载情况下随机选择，防止低负载打向单机
+    2. 宽恕策略：引入 grace_factor，防止对恢复期节点的误杀，提升吞吐
+    3. 粘性会话严格遵守并发上限，防止 OOM
+    4. 同负载情况下随机选择，防止低负载打向单机
     """
 
     def __init__(
@@ -183,7 +199,7 @@ class AsyncLLMServerManager:
         weight = self._estimate_prompt_weight(prompt_ids)
 
         async with self._lock:
-            # 打印当前状态快照（仅用于调试，生产环境可注释掉或改为采样）
+            # 打印当前状态快照（仅用于调试，生产环境建议降低频率）
             self._log_status_unsafe()
 
             # 1. 粘性会话检查
@@ -283,7 +299,7 @@ class AsyncLLMServerManager:
                 f"weight={e.running_weight:.2f} "
                 f"adj_load={adj_load:.2f} "  # 显示调整后的负载
                 f"latency={e.avg_latency:.3f}s "
-                f"(base={baseline:.3f}s)" # 显示当前基准
+                f"(base={baseline:.3f}s)"
             )
         print("=== Load Balance Snapshot ===\n" + "\n".join(status_lines))
 
