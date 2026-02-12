@@ -291,7 +291,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
                     # Reuse sticky server if it has capacity
                     sticky_entry.inflight_requests += 1
                     sticky_entry.running_weight += request_weight
-                    logger.debug(
+                    print(
                         f"[Sticky] req={request_id[:6]} -> Server {sticky_entry.index} "
                         f"(inflight={sticky_entry.inflight_requests})"
                     )
@@ -323,7 +323,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             self.request_id_to_entry[request_id] = chosen_entry
 
             # Log dispatch decision with load metrics
-            logger.debug(
+            print(
                 f"[Dispatch] req={request_id[:6]} -> Server {chosen_entry.index} "
                 f"(load={chosen_entry.effective_load(baseline_latency):.1f}, "
                 f"inflight_requests={chosen_entry.inflight_requests:.1f}, "
