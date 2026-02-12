@@ -88,21 +88,21 @@ class _ActorLoadEntry:
     def effective_load(self, baseline_latency: float = 1.0) -> float:
         """
         计算综合负载（含性能惩罚 + 宽恕阈值）
-        
+
         优化逻辑：
         1. 计算宽恕上限 (baseline * grace_factor)
         2. 如果延迟在宽恕范围内，不惩罚（perf_factor = 1.0）
         3. 如果延迟超出宽恕范围，按比例放大负载
-        
+
         Args:
             baseline_latency: 集群当前的基准延迟（通常取最小值或P50）
-        
+
         Returns:
             调整后的负载值。
         """
         # 1. 基础负载：排队数 + Token权重
         base_load = self.inflight_requests + self.running_weight
-        
+
         # 2. 性能惩罚计算
         if baseline_latency <= 0 or self.avg_latency <= 0:
             return base_load
@@ -195,52 +195,63 @@ class AsyncLLMServerManager:
     # ======================================================
     # 核心调度逻辑
     # ======================================================
+    # ======================================================
+    # 核心调度逻辑
+    # ======================================================
     async def _choose_server(self, request_id: str, *, prompt_ids) -> tuple[_ActorLoadEntry, float]:
         weight = self._estimate_prompt_weight(prompt_ids)
 
         async with self._lock:
-            # 打印当前状态快照（仅用于调试，生产环境建议降低频率）
-            self._log_status_unsafe()
+            # --- 优化：采样打印状态快照 ---
+            # 每 16 次请求打印一次全局快照，避免刷屏
+            if not hasattr(self, "_req_counter"):
+                self._req_counter = 0
+            self._req_counter += 1
+
+            if self._req_counter % 32 == 0:
+                self._log_status_unsafe()
 
             # 1. 粘性会话检查
             sticky_entry = self.request_id_to_entry.get(request_id)
             if sticky_entry is not None:
-                # 严格检查：只有未满载时才复用粘性会话
                 if sticky_entry.inflight_requests < sticky_entry.max_concurrency:
                     sticky_entry.inflight_requests += 1
                     sticky_entry.running_weight += weight
+                    # --- 优化：决策日志 ---
+                    # 打印粘性复用情况，方便追踪
+                    print(
+                        f"[Sticky] req={request_id[:6]} -> Server {sticky_entry.idx} (inflight={sticky_entry.inflight_requests})"
+                    )
                     return sticky_entry, weight
                 else:
-                    # 服务已满，放弃粘性，重新路由
                     self.request_id_to_entry.pop(request_id)
 
             # 2. 负载均衡选择
-            # 筛选有空余槽位的服务器
             available_entries = [e for e in self._entries if e.is_available()]
-
             if not available_entries:
-                # 全部满载，退化为在所有服务器中选择最小负载
                 available_entries = self._entries
 
-            # --- 关键优化：计算动态基准延迟 ---
-            # 取所有可用节点延迟的最小值作为基准（代表理想性能）
             valid_latencies = [e.avg_latency for e in available_entries if e.avg_latency > 0]
             baseline_latency = min(valid_latencies) if valid_latencies else 1.0
 
-            # 计算最小负载值（传入 baseline）
             min_load = min(e.effective_load(baseline_latency) for e in available_entries)
-
-            # 关键优化：找出所有等于最小负载的服务器，随机选择一个
-            best_entries = [
-                e for e in available_entries 
-                if e.effective_load(baseline_latency) == min_load
-            ]
+            best_entries = [e for e in available_entries if e.effective_load(baseline_latency) == min_load]
             chosen_entry = random.choice(best_entries)
 
             # 3. 占位与映射
             chosen_entry.inflight_requests += 1
             chosen_entry.running_weight += weight
             self.request_id_to_entry[request_id] = chosen_entry
+
+            # --- 优化：决策日志 ---
+            # 打印本次选择了哪个 Server，以及当时的负载快照
+            # 格式：[Dispatch] Request -> Server ID (LoadInfo) | Reason
+            print(
+                f"[Dispatch] req={request_id[:6]} -> Server {chosen_entry.idx} "
+                f"(load={chosen_entry.effective_load(baseline_latency):.1f}, "
+                f"inflight={chosen_entry.inflight_requests}, "
+                f"lat={chosen_entry.avg_latency:.1f}s)"
+            )
 
             return chosen_entry, weight
 
@@ -282,26 +293,25 @@ class AsyncLLMServerManager:
                 entry.update_latency(latency)
 
     def _log_status_unsafe(self):
-        """打印状态快照，包含延迟惩罚后的负载"""
-        
-        # 计算当前全局基准延迟用于日志显示
+        """打印紧凑的单行状态快照"""
+
+        # 计算基准
         valid_latencies = [e.avg_latency for e in self._entries if e.avg_latency > 0]
         baseline = min(valid_latencies) if valid_latencies else 1.0
 
-        status_lines = []
+        # 构造单行紧凑信息
+        # 格式：S0(inflight|latency|adj_load) ...
+        parts = []
         for e in self._entries:
-            # 计算调整后的负载
             adj_load = e.effective_load(baseline)
-            
-            status_lines.append(
-                f"[Server {e.idx}] "
-                f"inflight={e.inflight_requests} "
-                f"weight={e.running_weight:.2f} "
-                f"adj_load={adj_load:.2f} "  # 显示调整后的负载
-                f"latency={e.avg_latency:.3f}s "
-                f"(base={baseline:.3f}s)"
-            )
-        print("=== Load Balance Snapshot ===\n" + "\n".join(status_lines))
+            # 只保留整数 inflight 和 1位小数 latency/load，极度紧凑
+            parts.append(f"S{e.idx}({e.inflight}|{e.avg_latency:5.1f}s|{adj_load:4.1f})")
+
+        # 汇总信息：Total Inflight, Min Latency
+        total_inflight = sum(e.inflight_requests for e in self._entries)
+        log_msg = f"[Snapshot] Total={total_inflight} Base={baseline:.2f}s | " + " ".join(parts)
+
+        print(log_msg)
 
     # ======================================================
     # 调试接口
