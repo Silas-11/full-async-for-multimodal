@@ -305,7 +305,7 @@ class AsyncLLMServerManager:
         for e in self._entries:
             adj_load = e.effective_load(baseline)
             # 只保留整数 inflight 和 1位小数 latency/load，极度紧凑
-            parts.append(f"S{e.idx}({e.inflight}|{e.avg_latency:5.1f}s|{adj_load:4.1f})")
+            parts.append(f"S{e.idx}({e.inflight_requests}|{e.avg_latency:5.1f}s|{adj_load:4.1f})")
 
         # 汇总信息：Total Inflight, Min Latency
         total_inflight = sum(e.inflight_requests for e in self._entries)
