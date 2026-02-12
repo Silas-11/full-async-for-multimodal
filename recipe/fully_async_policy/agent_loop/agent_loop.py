@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import asyncio
 import logging
 import math
@@ -43,8 +44,48 @@ from verl.utils.rollout_trace import (
     rollout_trace_op,
 )
 
+# Configure logger
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class FullyAsyncLLMServerManager(AsyncLLMServerManager):
+    """Base implementation of fully async LLM server manager"""
+
+    @rollout_trace_op
+    async def generate_for_partial(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ) -> tuple[list[Any], list[Any], Any] | tuple[Sequence[int], list[float], bool]:
+        """Generate tokens from prompt ids, used for async partial.
+
+        Args:
+            request_id (str): Request ID for sticky session.
+            prompt_ids (List[int]): List of prompt token IDs.
+            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            image_data (Optional[List[Any]]): Optional image data for multimodal generation.
+            video_data (Optional[List[Any]]): Optional video data for multimodal generation.
+
+        Returns:
+            Tuple: Generation output containing:
+                - Element 0 (Sequence[int]): Generated response token IDs.
+                - Element 1 (List[float]): Log probabilities for the response token IDs.
+                - Element 2 (bool): Flag indicating cancellation status.
+        """
+        server = self._choose_server(request_id)
+        output = await server.generate_for_partial.remote(
+            request_id=request_id,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            video_data=video_data,
+        )
+        return output
 
 
 # ==============================================
@@ -74,9 +115,9 @@ class _ActorLoadEntry:
         """Initialize a load tracking entry for an actor
 
         Args:
-            actor: The actor/server instance to track
-            index: Unique identifier/index for the actor
-            max_concurrency: Maximum concurrent requests allowed for this actor
+            actor: The actor/server instance to track.
+            index: Unique identifier/index for the actor.
+            max_concurrency: Maximum concurrent requests allowed for this actor.
         """
         self.actor = actor
         self.index = index
@@ -94,10 +135,10 @@ class _ActorLoadEntry:
         the baseline latency across all available actors.
 
         Args:
-            baseline_latency: Minimum latency across all available actors
+            baseline_latency: Minimum latency across all available actors.
 
         Returns:
-            Calculated effective load value
+            float: Calculated effective load value.
         """
         base_load = self.inflight_requests + self.running_weight
 
@@ -117,17 +158,17 @@ class _ActorLoadEntry:
         """Check if the actor can accept more requests
 
         Returns:
-            True if inflight requests are below max concurrency limit
+            bool: True if inflight requests are below max concurrency limit.
         """
         return self.inflight_requests < self.max_concurrency
 
     def update_latency(self, latency: float):
         """Update rolling average latency with exponential moving average
 
-        Uses 90% historical average + 10% new value to smooth out fluctuations
+        Uses 90% historical average + 10% new value to smooth out fluctuations.
 
         Args:
-            latency: Latency of the most recently completed request (seconds)
+            latency: Latency of the most recently completed request (seconds).
         """
         if latency < 0:
             return
@@ -137,9 +178,9 @@ class _ActorLoadEntry:
 
 
 # ==============================================
-# Fully Async LLM Server Manager (V7.1 Optimized)
+# Fully Async LLM Server Manager (Optimized)
 # ==============================================
-class FullyAsyncLLMServerManager(AsyncLLMServerManager):
+class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     """V7.1 Latency-Aware Optimized Async LLM Server Manager
 
     Enhanced version with:
@@ -152,7 +193,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     def __init__(
         self,
         config: Any,
-        server_handles: list,
+        server_handles: list[Any],
         *,
         max_concurrency_per_server: int = 32,
         weight_alpha: float = 0.2,
@@ -161,11 +202,11 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         """Initialize the enhanced async LLM server manager
 
         Args:
-            config: Server configuration object
-            server_handles: List of actor/server handles to manage
-            max_concurrency_per_server: Max concurrent requests per server
-            weight_alpha: Scaling factor for token weight calculation
-            max_cache_size: Maximum size for request ID cache
+            config: Server configuration object.
+            server_handles: List of actor/server handles to manage.
+            max_concurrency_per_server: Max concurrent requests per server.
+            weight_alpha: Scaling factor for token weight calculation.
+            max_cache_size: Maximum size for request ID cache.
         """
         # Initialize parent class with base configuration
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
@@ -192,10 +233,10 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         using log2 scaling to prevent excessive weighting of very long prompts.
 
         Args:
-            prompt_ids: List of token IDs or list of lists of token IDs
+            prompt_ids: List of token IDs or list of lists of token IDs.
 
         Returns:
-            Calculated weight value (0.0 if input is invalid/empty)
+            float: Calculated weight value (0.0 if input is invalid/empty).
         """
         if not prompt_ids:
             return 0.0
@@ -225,14 +266,14 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         3. Dynamic baseline latency adjustment
         4. Random selection among equally optimal servers
 
-        Note: Extended override with additional prompt_ids parameter
+        Note: Extended override with additional prompt_ids parameter.
 
         Args:
-            request_id: Unique identifier for the request
-            prompt_ids: Token IDs for weight calculation
+            request_id: Unique identifier for the request.
+            prompt_ids: Token IDs for weight calculation.
 
         Returns:
-            Tuple of (selected entry, calculated weight)
+            Tuple[_ActorLoadEntry, float]: Selected entry and calculated weight.
         """
         # Calculate request weight based on token count
         request_weight = self._estimate_prompt_weight(prompt_ids)
@@ -250,7 +291,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                     # Reuse sticky server if it has capacity
                     sticky_entry.inflight_requests += 1
                     sticky_entry.running_weight += request_weight
-                    print(
+                    logger.debug(
                         f"[Sticky] req={request_id[:6]} -> Server {sticky_entry.index} "
                         f"(inflight={sticky_entry.inflight_requests})"
                     )
@@ -282,9 +323,10 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             self.request_id_to_entry[request_id] = chosen_entry
 
             # Log dispatch decision with load metrics
-            print(
+            logger.debug(
                 f"[Dispatch] req={request_id[:6]} -> Server {chosen_entry.index} "
                 f"(load={chosen_entry.effective_load(baseline_latency):.1f}, "
+                f"inflight_requests={chosen_entry.inflight_requests:.1f}, "
                 f"lat={chosen_entry.avg_latency:.1f}s)"
             )
 
@@ -309,14 +351,14 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         with latency awareness and token-based weighting.
 
         Args:
-            request_id: Unique request identifier
-            prompt_ids: List of token IDs for the prompt
-            sampling_params: Generation parameters (temperature, top_p, etc.)
-            image_data: Optional image data for multimodal generation
-            video_data: Optional video data for multimodal generation
+            request_id: Unique request identifier.
+            prompt_ids: List of token IDs for the prompt.
+            sampling_params: Generation parameters (temperature, top_p, etc.).
+            image_data: Optional image data for multimodal generation.
+            video_data: Optional video data for multimodal generation.
 
         Returns:
-            Generation result from the selected server
+            Any: Generation result from the selected server.
         """
         # Select optimal server using enhanced logic
         entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
@@ -357,14 +399,14 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         the same latency-aware scheduling as the main generate method.
 
         Args:
-            request_id: Unique request identifier
-            prompt_ids: Token IDs (flat list or list of lists)
-            sampling_params: Generation parameters
-            image_data: Optional image data for multimodal generation
-            video_data: Optional video data for multimodal generation
+            request_id: Unique request identifier.
+            prompt_ids: Token IDs (flat list or list of lists).
+            sampling_params: Generation parameters.
+            image_data: Optional image data for multimodal generation.
+            video_data: Optional video data for multimodal generation.
 
         Returns:
-            Partial generation result from the selected server
+            Tuple: Partial generation result from the selected server.
         """
         # Select optimal server using enhanced logic
         entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
@@ -411,7 +453,18 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         total_inflight = sum(e.inflight_requests for e in self._entries)
 
         # Log consolidated status
-        print(f"[Snapshot] Total={total_inflight} Base={baseline_latency:.2f}s | " + " ".join(server_status_parts))
+        logger.debug(
+            f"[Snapshot] Total={total_inflight} Base={baseline_latency:.2f}s | {' '.join(server_status_parts)}"
+        )
+
+
+# ==============================================
+# Main Entry Point (Environment Variable Control)
+# ==============================================
+# Dynamically select implementation based on environment variable
+if os.environ.get("USE_BALANCE_LOAD") == "1":
+    FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
+    logger.info("Initialized FullyAsyncLLMServerManager with FullyAsyncLLMServerManagerBalance")
 
 
 @ray.remote
