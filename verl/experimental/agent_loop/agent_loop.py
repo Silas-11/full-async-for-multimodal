@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import heapq
 import logging
 import math
 import os
@@ -55,48 +54,58 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-# ===============================
-# Per-actor load entry
-# ===============================
-
-
+# ==============================================
+# Per-actor runtime load entry (V6 Final)
+# ==============================================
 class _ActorLoadEntry:
     """
-    Per-actor EWMA load tracker.
+    实时负载跟踪器
     """
 
-    __slots__ = ("actor", "idx", "load", "last_ts")
+    __slots__ = (
+        "actor",
+        "idx",
+        "inflight_requests",
+        "running_weight",
+        "max_concurrency",
+        "avg_latency",
+        "finished_count",
+    )
 
-    def __init__(self, actor: ray.actor.ActorHandle, idx: int):
+    def __init__(self, actor: ray.actor.ActorHandle, idx: int, max_concurrency: int):
         self.actor = actor
         self.idx = idx
-        self.load: float = 0.0
-        self.last_ts: float = time.time()
+        self.inflight_requests: int = 0
+        self.running_weight: float = 0.0
+        self.max_concurrency = max_concurrency
+        self.avg_latency: float = 0.0
+        self.finished_count: int = 0
 
-    def decay(self, now: float, tau: float):
-        """
-        Exponential decay:
-            load(t) = load(t0) * exp(-(t - t0) / tau)
-        """
-        dt = now - self.last_ts
-        if dt > 0:
-            self.load *= math.exp(-dt / tau)
-            self.last_ts = now
+    def effective_load(self) -> float:
+        # 综合负载 = 请求数 + 权重
+        # 注意：这里隐式地给请求数赋予了 1.0 的基础权重
+        return self.inflight_requests + self.running_weight
+
+    def is_available(self) -> bool:
+        return self.inflight_requests < self.max_concurrency
+
+    def update_latency(self, latency: float):
+        self.finished_count += 1
+        # EWMA 移动平均
+        self.avg_latency = 0.9 * self.avg_latency + 0.1 * latency
 
 
-# ===============================
-# Async LLM Server Manager
-# ===============================
-
-
+# ==============================================
+# Async LLM Server Manager (V6 Final)
+# ==============================================
 class AsyncLLMServerManager:
     """
-    Fully async vLLM server manager with:
+    V6 最终优化版
 
-    - Strict EWMA load modeling
-    - Prompt-aware weight estimation
-    - Sticky session support
-    - O(N) decay (acceptable for small N)
+    改进点：
+    1. 粘性会话严格遵守并发上限，防止 OOM
+    2. 同负载情况下随机选择，防止低负载打向单机
+    3. 简化锁逻辑，确保高性能
     """
 
     def __init__(
@@ -104,150 +113,97 @@ class AsyncLLMServerManager:
         config: Any,
         server_handles: list[ray.actor.ActorHandle],
         *,
-        tau: float = 3.0,
-        max_cache_size: int = 10_000,
+        max_concurrency_per_server: int = 32,
+        weight_alpha: float = 0.2,
+        max_cache_size: int = 10000,
     ):
-        assert tau > 0, "tau must be positive"
-
         self.config = config
-        self.tau = tau
+        self.weight_alpha = weight_alpha
 
+        # 保护共享状态的互斥锁
+        self._lock = asyncio.Lock()
+
+        # 初始化服务器句柄，随机打乱避免初始热点
         self.server_handles = list(server_handles)
         random.shuffle(self.server_handles)
 
-        # Sticky mapping: request_id -> _ActorLoadEntry
-        self.request_id_to_actor: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
+        # 构建负载跟踪实体
+        self._entries: list[_ActorLoadEntry] = [
+            _ActorLoadEntry(actor, idx, max_concurrency_per_server) for idx, actor in enumerate(self.server_handles)
+        ]
 
-        # Actor entries
-        self._entries: list[_ActorLoadEntry] = []
-        self._heap: list[tuple[float, int, _ActorLoadEntry]] = []
+        # 粘性会话映射
+        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
 
-        for idx, actor in enumerate(self.server_handles):
-            entry = _ActorLoadEntry(actor, idx)
-            self._entries.append(entry)
-            self._heap.append((entry.load, entry.idx, entry))
-
-        heapq.heapify(self._heap)
-
-    # ======================================
-    # Prompt analysis
-    # ======================================
-
-    def _analyze_prompt_ids(self, prompt_ids) -> tuple[int, int]:
-        """
-        Return:
-            total_tokens
-            num_sequences
-        """
-
+    # ======================================================
+    # Prompt 权重估算
+    # ======================================================
+    def _estimate_prompt_weight(self, prompt_ids) -> float:
         if not prompt_ids:
-            return 0, 0
+            return 0.0
 
-        first = prompt_ids[0]
-
-        # Case 1: List[int]
-        if isinstance(first, int):
-            return len(prompt_ids), 1
-
-        # Case 2: List[List[int]]
-        if isinstance(first, list):
-            total_tokens = sum(len(p) for p in prompt_ids)
-            return total_tokens, len(prompt_ids)
-
-        raise TypeError(f"Unsupported prompt_ids type: got {type(first)}")
-
-    def _estimate_request_weight(self, prompt_ids) -> float:
-        """
-        Prompt-aware weight:
-
-            weight = log2(total_tokens + 1)
-
-        Log scaling prevents extreme dominance by long prompts.
-        """
-
-        total_tokens, _ = self._analyze_prompt_ids(prompt_ids)
+        try:
+            # 兼容不同格式的 prompt_ids
+            if isinstance(prompt_ids[0], int):
+                total_tokens = len(prompt_ids)
+            else:
+                total_tokens = sum(len(p) for p in prompt_ids)
+        except (TypeError, IndexError):
+            total_tokens = 0
 
         if total_tokens <= 0:
             return 0.0
 
-        return math.log2(total_tokens + 1.0)
+        # Log 缩放，防止超长 Prompt 权重过大
+        return self.weight_alpha * math.log2(total_tokens + 1.0)
 
-    # ======================================
-    # Core scheduler
-    # ======================================
+    # ======================================================
+    # 核心调度逻辑
+    # ======================================================
+    async def _choose_server(self, request_id: str, *, prompt_ids) -> tuple[_ActorLoadEntry, float]:
+        weight = self._estimate_prompt_weight(prompt_ids)
 
-    def _choose_server(
-        self,
-        request_id: str,
-        *,
-        prompt_ids,
-    ) -> ray.actor.ActorHandle:
-        """
-        Strict EWMA scheduling:
+        async with self._lock:
+            # 1. 粘性会话检查
+            sticky_entry = self.request_id_to_entry.get(request_id)
+            if sticky_entry is not None:
+                # 严格检查：只有未满载时才复用粘性会话
+                # 如果允许超载，可将 < 改为 < max * factor
+                if sticky_entry.inflight_requests < sticky_entry.max_concurrency:
+                    sticky_entry.inflight_requests += 1
+                    sticky_entry.running_weight += weight
+                    return sticky_entry, weight
+                else:
+                    # 服务已满，放弃粘性，重新路由
+                    self.request_id_to_entry.pop(request_id)
 
-        1. Sticky check
-        2. Full decay for all actors
-        3. Pick minimal load
-        4. Inject new weight
-        """
+            # 2. 负载均衡选择
+            # 筛选有空余槽位的服务器
+            available_entries = [e for e in self._entries if e.is_available()]
 
-        # ------------------------------
-        # 1. Sticky session
-        # ------------------------------
-        entry = self.request_id_to_actor.get(request_id)
-        if entry is not None:
-            print(f"[scheduler][sticky] req={request_id} -> actor={entry.idx} load={entry.load:.4f}")
-            return entry.actor
+            if not available_entries:
+                # 全部满载，退化为在所有服务器中选择最小负载
+                # 这是一个软降级，保证请求不被拒绝，但会增加排队延迟
+                available_entries = self._entries
 
-        now = time.time()
+            # 计算最小负载值
+            min_load = min(e.effective_load() for e in available_entries)
 
-        # ------------------------------
-        # 2. Full decay for ALL actors
-        # ------------------------------
-        for e in self._entries:
-            e.decay(now, self.tau)
+            # 关键优化：找出所有等于最小负载的服务器，随机选择一个
+            # 避免在低负载时请求全部打向列表中的第一个服务器
+            best_entries = [e for e in available_entries if e.effective_load() == min_load]
+            chosen_entry = random.choice(best_entries)
 
-        # Rebuild heap (loads changed)
-        self._heap = [(e.load, e.idx, e) for e in self._entries]
-        heapq.heapify(self._heap)
+            # 3. 占位与映射
+            chosen_entry.inflight_requests += 1
+            chosen_entry.running_weight += weight
+            self.request_id_to_entry[request_id] = chosen_entry
 
-        # ------------------------------
-        # 3. Pick minimal load actor
-        # ------------------------------
-        _, _, entry = heapq.heappop(self._heap)
+            return chosen_entry, weight
 
-        # ------------------------------
-        # 4. Prompt-aware weight
-        # ------------------------------
-        total_tokens, num_seqs = self._analyze_prompt_ids(prompt_ids)
-        weight = self._estimate_request_weight(prompt_ids)
-
-        before = entry.load
-        entry.load += weight
-        after = entry.load
-
-        # Push back to heap
-        heapq.heappush(self._heap, (entry.load, entry.idx, entry))
-
-        # Record sticky mapping
-        self.request_id_to_actor[request_id] = entry
-
-        print(
-            f"[scheduler] "
-            f"req={request_id} "
-            f"seqs={num_seqs} "
-            f"tokens={total_tokens} "
-            f"weight={weight:.3f} | "
-            f"actor={entry.idx} "
-            f"load {before:.4f} -> {after:.4f}"
-        )
-
-        return entry.actor
-
-    # ------------------------------------------------------------------
-    # Public async generation API
-    # ------------------------------------------------------------------
-
+    # ======================================================
+    # 对外 API
+    # ======================================================
     async def generate(
         self,
         request_id: str,
@@ -257,31 +213,46 @@ class AsyncLLMServerManager:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ):
-        """
-        Asynchronous token generation API.
+        entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
+        start_time = time.time()
 
-        This method:
-        1. Selects a server via sticky session + EWMA load balancing
-        2. Issues a non-blocking Ray remote call to the vLLM server
-        3. Returns the generation result directly
+        try:
+            # 发起远程调用
+            result = await entry.actor.generate.remote(
+                request_id=uuid4().hex,  # 内部追踪 ID
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return result
 
-        Note:
-        No explicit load decrement is required. The EWMA load
-        naturally decays over time, allowing short requests to
-        release pressure automatically.
-        """
-        server = self._choose_server(
-            request_id,
-            prompt_ids=prompt_ids,
-        )
+        finally:
+            # 异常安全的资源回收
+            end_time = time.time()
+            latency = end_time - start_time
 
-        return await server.generate.remote(
-            request_id=uuid4().hex,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            video_data=video_data,
-        )
+            async with self._lock:
+                # 防御性编程：确保计数不会变负
+                entry.inflight_requests = max(0, entry.inflight_requests - 1)
+                entry.running_weight = max(0.0, entry.running_weight - weight)
+                entry.update_latency(latency)
+
+    # ======================================================
+    # 调试接口
+    # ======================================================
+    async def dump_load_status(self):
+        async with self._lock:
+            lines = []
+            for e in self._entries:
+                lines.append(
+                    f"[Server {e.idx}] "
+                    f"inflight={e.inflight_requests} "
+                    f"weight={e.running_weight:.2f} "
+                    f"load={e.effective_load():.2f} "
+                    f"latency={e.avg_latency:.3f}s"
+                )
+            logger.info("\n".join(lines))
 
 
 class AgentLoopMetrics(BaseModel):

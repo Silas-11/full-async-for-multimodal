@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional, Sequence
 
 import hydra
@@ -47,35 +48,39 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     @rollout_trace_op
     async def generate_for_partial(
         self,
-        request_id,
+        request_id: str,
         *,
-        prompt_ids: list[int],
+        prompt_ids: list[int] | list[list[int]],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
-    ) -> tuple[list[Any], list[Any], Any] | tuple[Sequence[int], list[float], bool]:
-        """Generate tokens from prompt ids, used for async partial.
+    ) -> tuple[Any, Any, Any] | tuple[Sequence[int], list[float], bool]:
+        """Generate tokens from prompt ids, used for async partial."""
 
-        Args:
-            request_id (str): request id for sticky session.
-            prompt_ids (List[int]): List of prompt token ids.
-            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+        # ⚠️ await 异步服务器选择
+        entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
+        start_time = time.time()
 
-        Returns:
-            output: A tuple representing the generation output.
-            - Element 0 (Sequence[int]): Generated response token IDs.
-            - Element 1 (list[float]): Log probabilities for the response token IDs.
-            - Element 2 (bool): A flag or status indicating cancellation.
-        """
-        server = self._choose_server(request_id, prompt_ids=prompt_ids)
-        output = await server.generate_for_partial.remote(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            video_data=video_data,
-        )
-        return output
+        try:
+            # 发起远程调用
+            output = await entry.actor.generate_for_partial.remote(
+                request_id=request_id,  # 内部唯一追踪 ID
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return output
+
+        finally:
+            # 异常安全回收，与父类逻辑保持一致
+            end_time = time.time()
+            latency = end_time - start_time
+
+            async with self._lock:
+                entry.inflight_requests = max(0, entry.inflight_requests - 1)
+                entry.running_weight = max(0.0, entry.running_weight - weight)
+                entry.update_latency(latency)
 
 
 @ray.remote
