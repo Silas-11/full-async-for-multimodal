@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import heapq
 import logging
-import math
 import os
 import random
-import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -46,279 +45,81 @@ from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
+    rollout_trace_op,
 )
 from verl.utils.transferqueue_utils import tqbridge
-from verl.workers.rollout.replica import get_rollout_replica_class
+from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-# ==============================================
-# Per-actor runtime load entry (V7.1 Final)
-# ==============================================
-class _ActorLoadEntry:
-    """
-    实时负载跟踪器
-    """
-
-    __slots__ = (
-        "actor",
-        "idx",
-        "inflight_requests",
-        "running_weight",
-        "max_concurrency",
-        "avg_latency",
-        "finished_count",
-    )
-
-    # 宽恕因子：允许延迟比基准高出该倍数而不受惩罚
-    # 1.5 表示允许延迟比基准高 50% 而不进行惩罚，兼顾吞吐与稳定性
-    LATENCY_GRACE_FACTOR = 1.5
-
-    def __init__(self, actor, idx: int, max_concurrency: int):
-        self.actor = actor
-        self.idx = idx
-        self.inflight_requests: int = 0
-        self.running_weight: float = 0.0
-        self.max_concurrency = max_concurrency
-        self.avg_latency: float = 0.0
-        self.finished_count: int = 0
-
-    def effective_load(self, baseline_latency: float = 1.0) -> float:
-        """
-        计算综合负载（含性能惩罚 + 宽恕阈值）
-
-        优化逻辑：
-        1. 计算宽恕上限 (baseline * grace_factor)
-        2. 如果延迟在宽恕范围内，不惩罚（perf_factor = 1.0）
-        3. 如果延迟超出宽恕范围，按比例放大负载
-
-        Args:
-            baseline_latency: 集群当前的基准延迟（通常取最小值或P50）
-
-        Returns:
-            调整后的负载值。
-        """
-        # 1. 基础负载：排队数 + Token权重
-        base_load = self.inflight_requests + self.running_weight
-
-        # 2. 性能惩罚计算
-        if baseline_latency <= 0 or self.avg_latency <= 0:
-            return base_load
-
-        # 核心优化：计算宽恕上限
-        # 例如：基准 1s，宽恕因子 1.5 -> 只要有 1.5s 以内的延迟都算“正常波动”
-        grace_threshold = baseline_latency * self.LATENCY_GRACE_FACTOR
-
-        if self.avg_latency <= grace_threshold:
-            # 延迟在可接受范围内，不进行惩罚，保持高吞吐
-            return base_load
-        else:
-            # 延迟过高（如长请求积压），放大负载权重，引导流量去快节点
-            # 慢多少倍，负载就放大多少倍
-            perf_factor = self.avg_latency / baseline_latency
-            return base_load * perf_factor
-
-    def is_available(self) -> bool:
-        return self.inflight_requests < self.max_concurrency
-
-    def update_latency(self, latency: float):
-        self.finished_count += 1
-        # EWMA 移动平均，平滑历史延迟
-        self.avg_latency = 0.9 * self.avg_latency + 0.1 * latency
-
-
-# ==============================================
-# Async LLM Server Manager (V7.1 Optimized)
-# ==============================================
 class AsyncLLMServerManager:
     """
-    V7.1 最终优化版
-
-    改进点：
-    1. 动态延迟感知：引入 baseline_latency，对慢节点进行负载惩罚
-    2. 宽恕策略：引入 grace_factor，防止对恢复期节点的误杀，提升吞吐
-    3. 粘性会话严格遵守并发上限，防止 OOM
-    4. 同负载情况下随机选择，防止低负载打向单机
+    A class to manage multiple OpenAI compatible LLM servers. This class provides
+    - Load balance: least requests load balancing
+    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
     """
 
-    def __init__(
-        self,
-        config: Any,
-        server_handles: list,
-        *,
-        max_concurrency_per_server: int = 32,
-        weight_alpha: float = 0.2,
-        max_cache_size: int = 10000,
-    ):
+    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
+        """Initialize the AsyncLLMServerManager.
+
+        Args:
+            config (DictConfig): YAML config.
+            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
+        """
         self.config = config
-        self.weight_alpha = weight_alpha
-
-        # 保护共享状态的互斥锁
-        self._lock = asyncio.Lock()
-
-        # 初始化服务器句柄，随机打乱避免初始热点
-        self.server_handles = list(server_handles)
+        self.server_handles = server_handles
         random.shuffle(self.server_handles)
 
-        # 构建负载跟踪实体
-        self._entries: list[_ActorLoadEntry] = [
-            _ActorLoadEntry(actor, idx, max_concurrency_per_server) for idx, actor in enumerate(self.server_handles)
-        ]
+        # Least requests load balancing
+        self.weighted_serveres = [[0, idx, server] for idx, server in enumerate(self.server_handles)]
+        heapq.heapify(self.weighted_serveres)
 
-        # 粘性会话映射
-        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
+        # LRU cache to map request_id to server
+        self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
-    # ======================================================
-    # Prompt 权重估算
-    # ======================================================
-    def _estimate_prompt_weight(self, prompt_ids) -> float:
-        if not prompt_ids:
-            return 0.0
+    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
+        # TODO: implement server pressure awareness load balancing
+        if request_id in self.request_id_to_server:
+            return self.request_id_to_server[request_id]
 
-        try:
-            # 兼容不同格式的 prompt_ids
-            if isinstance(prompt_ids[0], int):
-                total_tokens = len(prompt_ids)
-            else:
-                total_tokens = sum(len(p) for p in prompt_ids)
-        except (TypeError, IndexError):
-            total_tokens = 0
+        _, _, server = self.weighted_serveres[0]
+        self.weighted_serveres[0][0] += 1
+        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
+        self.request_id_to_server[request_id] = server
+        return server
 
-        if total_tokens <= 0:
-            return 0.0
-
-        # Log 缩放，防止超长 Prompt 权重过大
-        return self.weight_alpha * math.log2(total_tokens + 1.0)
-
-    # ======================================================
-    # 核心调度逻辑
-    # ======================================================
-    # ======================================================
-    # 核心调度逻辑
-    # ======================================================
-    async def _choose_server(self, request_id: str, *, prompt_ids) -> tuple[_ActorLoadEntry, float]:
-        weight = self._estimate_prompt_weight(prompt_ids)
-
-        async with self._lock:
-            # --- 优化：采样打印状态快照 ---
-            # 每 16 次请求打印一次全局快照，避免刷屏
-            if not hasattr(self, "_req_counter"):
-                self._req_counter = 0
-            self._req_counter += 1
-
-            if self._req_counter % 32 == 0:
-                self._log_status_unsafe()
-
-            # 1. 粘性会话检查
-            sticky_entry = self.request_id_to_entry.get(request_id)
-            if sticky_entry is not None:
-                if sticky_entry.inflight_requests < sticky_entry.max_concurrency:
-                    sticky_entry.inflight_requests += 1
-                    sticky_entry.running_weight += weight
-                    # --- 优化：决策日志 ---
-                    # 打印粘性复用情况，方便追踪
-                    print(
-                        f"[Sticky] req={request_id[:6]} -> Server {sticky_entry.idx} (inflight={sticky_entry.inflight_requests})"
-                    )
-                    return sticky_entry, weight
-                else:
-                    self.request_id_to_entry.pop(request_id)
-
-            # 2. 负载均衡选择
-            available_entries = [e for e in self._entries if e.is_available()]
-            if not available_entries:
-                available_entries = self._entries
-
-            valid_latencies = [e.avg_latency for e in available_entries if e.avg_latency > 0]
-            baseline_latency = min(valid_latencies) if valid_latencies else 1.0
-
-            min_load = min(e.effective_load(baseline_latency) for e in available_entries)
-            best_entries = [e for e in available_entries if e.effective_load(baseline_latency) == min_load]
-            chosen_entry = random.choice(best_entries)
-
-            # 3. 占位与映射
-            chosen_entry.inflight_requests += 1
-            chosen_entry.running_weight += weight
-            self.request_id_to_entry[request_id] = chosen_entry
-
-            # --- 优化：决策日志 ---
-            # 打印本次选择了哪个 Server，以及当时的负载快照
-            # 格式：[Dispatch] Request -> Server ID (LoadInfo) | Reason
-            print(
-                f"[Dispatch] req={request_id[:6]} -> Server {chosen_entry.idx} "
-                f"(load={chosen_entry.effective_load(baseline_latency):.1f}, "
-                f"inflight={chosen_entry.inflight_requests}, "
-                f"lat={chosen_entry.avg_latency:.1f}s)"
-            )
-
-            return chosen_entry, weight
-
-    # ======================================================
-    # 对外 API
-    # ======================================================
+    @rollout_trace_op
     async def generate(
         self,
-        request_id: str,
+        request_id,
         *,
-        prompt_ids: list,
+        prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
-    ):
-        entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
-        start_time = time.time()
+    ) -> TokenOutput:
+        """Generate tokens from prompt ids.
 
-        try:
-            # 发起远程调用
-            result = await entry.actor.generate.remote(
-                request_id=uuid4().hex,  # 内部追踪 ID
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-            )
-            return result
+        Args:
+            request_id (str): request id for sticky session.
+            prompt_ids (List[int]): List of prompt token ids.
+            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
 
-        finally:
-            # 异常安全的资源回收
-            end_time = time.time()
-            latency = end_time - start_time
-
-            async with self._lock:
-                # 防御性编程：确保计数不会变负
-                entry.inflight_requests = max(0, entry.inflight_requests - 1)
-                entry.running_weight = max(0.0, entry.running_weight - weight)
-                entry.update_latency(latency)
-
-    def _log_status_unsafe(self):
-        """打印紧凑的单行状态快照"""
-
-        # 计算基准
-        valid_latencies = [e.avg_latency for e in self._entries if e.avg_latency > 0]
-        baseline = min(valid_latencies) if valid_latencies else 1.0
-
-        # 构造单行紧凑信息
-        # 格式：S0(inflight|latency|adj_load) ...
-        parts = []
-        for e in self._entries:
-            adj_load = e.effective_load(baseline)
-            # 只保留整数 inflight 和 1位小数 latency/load，极度紧凑
-            parts.append(f"S{e.idx}({e.inflight_requests}|{e.avg_latency:5.1f}s|{adj_load:4.1f})")
-
-        # 汇总信息：Total Inflight, Min Latency
-        total_inflight = sum(e.inflight_requests for e in self._entries)
-        log_msg = f"[Snapshot] Total={total_inflight} Base={baseline:.2f}s | " + " ".join(parts)
-
-        print(log_msg)
-
-    # ======================================================
-    # 调试接口
-    # ======================================================
-    async def dump_load_status(self):
-        async with self._lock:
-            self._log_status_unsafe()
+        Returns:
+            TokenOutput: token output
+        """
+        server = self._choose_server(request_id)
+        output = await server.generate.remote(
+            request_id=uuid4().hex,  # use new request_id for each turn
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            video_data=video_data,
+        )
+        return output
 
 
 class AgentLoopMetrics(BaseModel):
