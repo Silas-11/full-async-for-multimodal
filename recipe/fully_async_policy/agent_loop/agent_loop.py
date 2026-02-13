@@ -87,13 +87,16 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         )
         return output
 
+# Assuming AsyncLLMServerManager is defined in the same file or imported
+# from .base import AsyncLLMServerManager 
+# Assuming rollout_trace_op is defined or imported
+
 # ==============================================
-# Per-actor runtime load entry (V8.2 Minimalist)
+# Per-actor runtime load entry
 # ==============================================
 class _ActorLoadEntry:
-    """Minimalist tracker: only tracks inflight request count"""
     __slots__ = ("actor", "index", "inflight_requests", "max_concurrency")
-
+    
     def __init__(self, actor, index: int, max_concurrency: int):
         self.actor = actor
         self.index = index
@@ -101,23 +104,24 @@ class _ActorLoadEntry:
         self.max_concurrency = max_concurrency
 
     def is_available(self) -> bool:
+        # Determine if the node is "busy" (full)
         return self.inflight_requests < self.max_concurrency
 
 # ==============================================
-# Fully Async LLM Server Manager (V8.2 Two Random Choices)
+# Fully Async LLM Server Manager (V8.3 Smart Round Robin)
 # ==============================================
 class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
-    """V8.2 Two Random Choices Strategy
+    """V8.3 Smart Round Robin Strategy
     
-    Core Logic:
-    1. Pick 2 random servers.
-    2. Choose the one with lower inflight requests.
-    3. Fall back to round-robin if all servers are full.
+    Logic:
+    1. Follows strict Round-Robin order (Deterministic).
+    2. Checks if the selected node is full (inflight >= 16).
+    3. If full, SKIP to the next node.
+    4. If all nodes are full (rare due to global limit), pick the least loaded.
     
-    Why this works better for LLM:
-    - Avoids "Slow Request Trap" of Least-Connections.
-    - Distributes load evenly like Round-Robin but skips obviously full nodes.
-    - No weights, no latency history, pure and simple.
+    Advantage:
+    - Avoids sending requests to stuck/full nodes (Auto Fault Isolation).
+    - Preserves the fair distribution of Round-Robin.
     """
 
     def __init__(
@@ -125,7 +129,8 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         config: Any,
         server_handles: List[Any],
         *,
-        max_concurrency_per_server: int = 32,
+        # Default to 16 as per your system constraint
+        max_concurrency_per_server: int = 16, 
         max_cache_size: int = 10000,
     ):
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
@@ -134,56 +139,62 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             _ActorLoadEntry(actor, idx, max_concurrency_per_server) 
             for idx, actor in enumerate(self.server_handles)
         ]
-        # Pre-calculate indices for random choice to avoid range() overhead if possible, 
-        # but random.sample is fine.
         self._num_servers = len(self._entries)
+        
+        # Pointer for Round Robin
+        self._rr_index = 0
         
         self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
         self._request_counter = 0
 
     def _choose_server(self, request_id: str, *, prompt_ids) -> _ActorLoadEntry:
-        """Synchronous O(1) server selection using Two Random Choices"""
+        """Deterministic server selection with skip-logic"""
         
-        # 1. Sticky Session Check
+        # 1. Sticky Session Check (for partial rollouts)
         sticky_entry = self.request_id_to_entry.get(request_id)
         if sticky_entry is not None:
             if sticky_entry.is_available():
                 sticky_entry.inflight_requests += 1
                 return sticky_entry
             else:
+                # If the sticky server is full, we have to reschedule to a new one
+                # This ensures we don't block if the previous server is stuck
                 self.request_id_to_entry.pop(request_id)
 
-        # 2. Two Random Choices Algorithm
-        # 如果节点数少于2，直接选第一个（或仅有的那个）
-        if self._num_servers <= 1:
-            chosen_entry = self._entries[0]
-        else:
-            # 随机选两个不同的索引
-            idx1, idx2 = random.sample(range(self._num_servers), 2)
-            e1 = self._entries[idx1]
-            e2 = self._entries[idx2]
+        # 2. Smart Round Robin
+        chosen_entry = None
+        start_idx = self._rr_index
+        
+        # Traverse all nodes once to find an available one
+        for i in range(self._num_servers):
+            idx = (start_idx + i) % self._num_servers
+            entry = self._entries[idx]
             
-            # 简单比较 inflight (谁排队少选谁)
-            # 优先选 Available 的
-            if e1.is_available() and not e2.is_available():
-                chosen_entry = e1
-            elif not e1.is_available() and e2.is_available():
-                chosen_entry = e2
-            else:
-                # 都可用或都不可用，选 load 小的
-                chosen_entry = e1 if e1.inflight_requests <= e2.inflight_requests else e2
+            if entry.is_available():
+                # Found an available node!
+                chosen_entry = entry
+                # Update next start index to the NEXT node (standard RR behavior)
+                self._rr_index = (idx + 1) % self._num_servers
+                break
+        
+        # 3. Fallback: All nodes are full/overloaded
+        if chosen_entry is None:
+            # This case should theoretically not happen often due to global limits,
+            # but we handle it by picking the "least bad" option.
+            chosen_entry = min(self._entries, key=lambda e: e.inflight_requests)
 
-        # 3. 更新状态
+        # Update state
         chosen_entry.inflight_requests += 1
         self.request_id_to_entry[request_id] = chosen_entry
         
-        # 4. 简易日志
+        # Logging (optional, for debugging)
         self._request_counter += 1
         if self._request_counter % 128 == 0:
             self._request_counter = 0
-            # 仅打印选中的节点，方便调试
-            logger.info("[Dispatch] req=%s -> S%d (inflight=%d)", 
-                        request_id[:6], chosen_entry.index, chosen_entry.inflight_requests)
+            # Log current load distribution
+            loads = [e.inflight_requests for e in self._entries]
+            logger.info("[Dispatch V8.3] req=%s -> S%d. Current Load: %s", 
+                        request_id[:6], chosen_entry.index, loads)
 
         return chosen_entry
 
