@@ -88,36 +88,41 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return output
 
 
+import math
+import time
+from typing import Any, Optional, Sequence, List, Tuple
+
+# Assuming base classes and dependencies are imported
+# from your_module import AsyncLLMServerManager
+# from cachetools import LRUCache
+# from verl.utils.rollout_trace import rollout_trace_op
+
 # ==============================================
-# Per-actor runtime load entry (V7.1 Helper)
+# Per-actor runtime load entry (V7.1 Optimized)
 # ==============================================
 class _ActorLoadEntry:
     """Runtime load tracker for individual actor instances
-
-    Tracks inflight requests, running weight, latency metrics, and concurrency
-    limits for each actor/server instance to enable intelligent load balancing.
+    
+    Tracks key metrics for load balancing decisions: inflight requests,
+    running weight, latency statistics, and concurrency limits.
+    Uses slots for memory efficiency and faster attribute access.
     """
-
     __slots__ = (
-        "actor",
-        "index",
-        "inflight_requests",
-        "running_weight",
-        "max_concurrency",
-        "avg_latency",
-        "finished_count",
+        "actor", "index", "inflight_requests", "running_weight", 
+        "max_concurrency", "avg_latency", "finished_count",
     )
-
+    
     # Grace factor to tolerate minor latency fluctuations without penalty
-    LATENCY_GRACE_FACTOR = 1.5
+    # Scaled value (256) for high-concurrency short-request scenarios
+    LATENCY_GRACE_FACTOR = 256
 
     def __init__(self, actor, index: int, max_concurrency: int):
-        """Initialize a load tracking entry for an actor
-
+        """Initialize load tracking entry for an actor instance
+        
         Args:
-            actor: The actor/server instance to track.
-            index: Unique identifier/index for the actor.
-            max_concurrency: Maximum concurrent requests allowed for this actor.
+            actor: Actor/server instance to track
+            index: Unique identifier for the actor
+            max_concurrency: Maximum concurrent requests allowed
         """
         self.actor = actor
         self.index = index
@@ -128,119 +133,126 @@ class _ActorLoadEntry:
         self.finished_count: int = 0
 
     def effective_load(self, baseline_latency: float = 1.0) -> float:
-        """Calculate effective load with latency-based penalty
-
-        The effective load accounts for both current inflight requests and
-        a dynamic penalty based on how much the actor's latency exceeds
-        the baseline latency across all available actors.
-
+        """Calculate effective load with latency-based penalty (scaled)
+        
+        Effective load combines current inflight requests with running weight,
+        and applies a scaled latency penalty for values exceeding grace threshold.
+        Optimized for high-concurrency short-request scenarios.
+        
         Args:
-            baseline_latency: Minimum latency across all available actors.
-
+            baseline_latency: Minimum valid latency across available actors
+            
         Returns:
-            float: Calculated effective load value.
+            Calculated effective load value
         """
         base_load = self.inflight_requests + self.running_weight
-
-        # Return base load if latency metrics are not available
+        
+        # Return base load if latency metrics are invalid
         if baseline_latency <= 0 or self.avg_latency <= 0:
             return base_load
-
-        # Apply latency penalty only when exceeding grace threshold
+            
+        # Calculate scaled latency penalty
         grace_threshold = baseline_latency * self.LATENCY_GRACE_FACTOR
         if self.avg_latency <= grace_threshold:
             return base_load
-
-        # Scale load by latency ratio when above threshold
-        return base_load * (self.avg_latency / baseline_latency)
+            
+        # Apply scaled penalty for latencies above grace threshold
+        return base_load * (self.avg_latency / baseline_latency) / self.LATENCY_GRACE_FACTOR
 
     def is_available(self) -> bool:
-        """Check if the actor can accept more requests
-
+        """Check if actor can accept additional requests
+        
         Returns:
-            bool: True if inflight requests are below max concurrency limit.
+            True if inflight requests are below max concurrency limit
         """
         return self.inflight_requests < self.max_concurrency
 
-    def update_latency(self, latency: float):
+    def update_latency(self, latency: float, generated_tokens: int = 0):
         """Update rolling average latency with exponential moving average
-
-        Uses 90% historical average + 10% new value to smooth out fluctuations.
-
+        
+        Uses 90% historical average + 10% new value to smooth fluctuations.
+        Generated_tokens parameter is reserved for future throughput calculations.
+        
         Args:
-            latency: Latency of the most recently completed request (seconds).
+            latency: Latency of completed request in seconds (non-negative)
+            generated_tokens: Number of tokens generated (for future use)
         """
         if latency < 0:
             return
-
+            
         self.finished_count += 1
+        # EMA (Exponential Moving Average) with 10% weight on new value
         self.avg_latency = 0.9 * self.avg_latency + 0.1 * latency
 
 
 # ==============================================
-# Fully Async LLM Server Manager (Optimized)
+# Fully Async LLM Server Manager (Lock-Free Optimized)
 # ==============================================
 class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
-    """V7.1 Latency-Aware Optimized Async LLM Server Manager
-
-    Enhanced version with:
-    1. Dynamic latency awareness and penalty calculation
-    2. Token-based request weight estimation
-    3. Optimized logging and monitoring capabilities
-    4. Sticky session support with load-aware fallback
+    """V7.2 Lock-Free High-Performance Async LLM Server Manager
+    
+    Core Optimizations:
+    1. Lock-Free Design: Removed asyncio.Lock to eliminate serialization bottleneck
+    2. Synchronous Scheduling: _choose_server as sync method reduces coroutine switching
+    3. Performance Focused: Only critical metrics calculation retained
+    4. Memory Efficient: Minimal allocations in hot paths
+    
+    Optimized for high-concurrency short-request scenarios where lock contention
+    would otherwise be a significant bottleneck.
     """
 
     def __init__(
         self,
         config: Any,
-        server_handles: list[Any],
+        server_handles: List[Any],
         *,
         max_concurrency_per_server: int = 32,
         weight_alpha: float = 0.2,
         max_cache_size: int = 10000,
     ):
-        """Initialize the enhanced async LLM server manager
-
+        """Initialize lock-free high-performance server manager
+        
         Args:
-            config: Server configuration object.
-            server_handles: List of actor/server handles to manage.
-            max_concurrency_per_server: Max concurrent requests per server.
-            weight_alpha: Scaling factor for token weight calculation.
-            max_cache_size: Maximum size for request ID cache.
+            config: Server configuration object
+            server_handles: List of actor/server handles to manage
+            max_concurrency_per_server: Max concurrent requests per server
+            weight_alpha: Scaling factor for token weight calculation
+            max_cache_size: Maximum size for request ID to entry cache
         """
-        # Initialize parent class with base configuration
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
-
-        # Initialize subclass-specific properties
+        
+        # Configuration parameters
         self.weight_alpha = weight_alpha
-        self._lock = asyncio.Lock()  # Protect async state modifications
-
-        # Create load tracking entries for each server/actor
-        self._entries: list[_ActorLoadEntry] = [
-            _ActorLoadEntry(actor, idx, max_concurrency_per_server) for idx, actor in enumerate(self.server_handles)
+        
+        # Lock-free design: removed asyncio.Lock (key optimization)
+        self._entries: List[_ActorLoadEntry] = [
+            _ActorLoadEntry(actor, idx, max_concurrency_per_server) 
+            for idx, actor in enumerate(self.server_handles)
         ]
-
-        # Reset sticky session mapping (parent class cache lacks entry info)
-        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
-
-        # Request counter for periodic status logging
+        
+        # Sticky session mapping with LRU eviction
+        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(
+            maxsize=max_cache_size
+        )
+        
+        # Counter for throttled logging (reduce I/O overhead)
         self._request_counter = 0
 
     def _estimate_prompt_weight(self, prompt_ids) -> float:
-        """Estimate request weight based on token count using log scaling
-
-        Calculates a weighted value based on the number of tokens in the prompt,
-        using log2 scaling to prevent excessive weighting of very long prompts.
-
+        """Estimate request weight based on token count (log-scaled)
+        
+        Calculates weight using log2 scaling to prevent excessive weighting
+        of very long prompts. Optimized for minimal overhead in hot path.
+        
         Args:
-            prompt_ids: List of token IDs or list of lists of token IDs.
-
+            prompt_ids: List of token IDs or list of lists of token IDs
+            
         Returns:
-            float: Calculated weight value (0.0 if input is invalid/empty).
+            Calculated weight (0.0 for invalid/empty input)
         """
         if not prompt_ids:
             return 0.0
-
+            
         try:
             # Handle both flat list and list-of-lists token formats
             if isinstance(prompt_ids[0], int):
@@ -248,124 +260,111 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             else:
                 total_tokens = sum(len(p) for p in prompt_ids)
         except (TypeError, IndexError):
-            # Return 0 weight for malformed input
+            # Fast fail for malformed input (no stack trace in hot path)
             return 0.0
-
+            
         if total_tokens <= 0:
             return 0.0
-
-        # Calculate weighted value using log2 scaling
+            
+        # Log2 scaling with alpha factor to normalize weight
         return self.weight_alpha * math.log2(total_tokens + 1.0)
 
-    async def _choose_server(self, request_id: str, *, prompt_ids) -> tuple[_ActorLoadEntry, float]:
-        """Select optimal server using latency-aware load balancing (V7.1)
-
-        Enhanced selection logic with:
-        1. Sticky session support with load-aware fallback
-        2. Latency-based effective load calculation
-        3. Dynamic baseline latency adjustment
-        4. Random selection among equally optimal servers
-
-        Note: Extended override with additional prompt_ids parameter.
-
+    def _choose_server(self, request_id: str, *, prompt_ids) -> Tuple[_ActorLoadEntry, float]:
+        """Lock-free, synchronous ultra-fast server selection logic
+        
+        Optimized for high-concurrency scenarios with minimal overhead:
+        - No locks or async operations
+        - Minimal memory allocations
+        - O(N) traversal (faster than heap for small N)
+        - Atomic state updates (safe for single-threaded event loop)
+        
         Args:
-            request_id: Unique identifier for the request.
-            prompt_ids: Token IDs for weight calculation.
-
+            request_id: Unique request identifier for sticky session
+            prompt_ids: Token IDs for weight calculation
+            
         Returns:
-            Tuple[_ActorLoadEntry, float]: Selected entry and calculated weight.
+            Tuple of (selected entry, calculated request weight)
         """
         # Calculate request weight based on token count
         request_weight = self._estimate_prompt_weight(prompt_ids)
 
-        async with self._lock:
-            # Periodic status logging (every 32 requests)
-            self._request_counter += 1
-            if self._request_counter % 32 == 0:
-                self._log_status_unsafe()
+        # 1. Sticky Session Check (read operations are naturally safe)
+        sticky_entry = self.request_id_to_entry.get(request_id)
+        if sticky_entry is not None:
+            if sticky_entry.is_available():
+                # Atomic updates (safe in single-threaded event loop)
+                sticky_entry.inflight_requests += 1
+                sticky_entry.running_weight += request_weight
+                return sticky_entry, request_weight
+            else:
+                # Remove stale sticky mapping
+                self.request_id_to_entry.pop(request_id)
 
-            # 1. Check for existing sticky session
-            sticky_entry = self.request_id_to_entry.get(request_id)
-            if sticky_entry is not None:
-                if sticky_entry.is_available():
-                    # Reuse sticky server if it has capacity
-                    sticky_entry.inflight_requests += 1
-                    sticky_entry.running_weight += request_weight
-                    print(
-                        f"[Sticky] req={request_id[:6]} -> Server {sticky_entry.index} "
-                        f"(inflight={sticky_entry.inflight_requests})"
-                    )
-                    return sticky_entry, request_weight
-                else:
-                    # Remove sticky mapping if server is overloaded
-                    self.request_id_to_entry.pop(request_id)
+        # 2. Load Balancing Selection (lock-free O(N) traversal)
+        # Filter to available servers first (fallback to all if none available)
+        available_entries = [e for e in self._entries if e.is_available()]
+        if not available_entries:
+            available_entries = self._entries
 
-            # 2. Select server using latency-aware load balancing
-            # Filter to available servers first (fallback to all if none available)
-            available_entries = [e for e in self._entries if e.is_available()]
-            if not available_entries:
-                available_entries = self._entries
+        # Calculate dynamic baseline latency from valid measurements
+        valid_latencies = [e.avg_latency for e in available_entries if e.avg_latency > 0]
+        baseline_latency = min(valid_latencies) if valid_latencies else 1.0
 
-            # Calculate dynamic baseline latency from valid measurements
-            valid_latencies = [e.avg_latency for e in available_entries if e.avg_latency > 0]
-            baseline_latency = min(valid_latencies) if valid_latencies else 1.0
+        # Find server with minimum effective load (generator expression for memory efficiency)
+        chosen_entry = min(available_entries, key=lambda e: e.effective_load(baseline_latency))
 
-            # Find servers with minimum effective load
-            min_effective_load = min(e.effective_load(baseline_latency) for e in available_entries)
-            optimal_entries = [e for e in available_entries if e.effective_load(baseline_latency) == min_effective_load]
+        # Update state (atomic operations - safe in single-threaded context)
+        chosen_entry.inflight_requests += 1
+        chosen_entry.running_weight += request_weight
+        self.request_id_to_entry[request_id] = chosen_entry
 
-            # Randomly select one of the optimal servers for load distribution
-            chosen_entry = random.choice(optimal_entries)
-
-            # Update load tracking for the chosen server
-            chosen_entry.inflight_requests += 1
-            chosen_entry.running_weight += request_weight
-            self.request_id_to_entry[request_id] = chosen_entry
-
-            # Log dispatch decision with load metrics
-            print(
-                f"[Dispatch] req={request_id[:6]} -> Server {chosen_entry.index} "
-                f"(load={chosen_entry.effective_load(baseline_latency):.1f}, "
-                f"inflight_requests={chosen_entry.inflight_requests:.1f}, "
-                f"lat={chosen_entry.avg_latency:.1f}s)"
+        # Throttle logging to reduce I/O overhead (log every 100 requests)
+        self._request_counter += 1
+        if self._request_counter % 128 == 0:
+            # Reset counter to prevent integer overflow
+            self._request_counter = 0
+            logger.info(
+                "[Dispatch] req=%s -> S%d (load=%.1f)",
+                request_id[:6],
+                chosen_entry.index,
+                chosen_entry.effective_load(baseline_latency)
             )
 
-            return chosen_entry, request_weight
+        return chosen_entry, request_weight
 
-    # ======================================================
-    # Public API (overrides parent class methods)
-    # ======================================================
     @rollout_trace_op
     async def generate(
         self,
         request_id: str,
         *,
-        prompt_ids: list[int],
+        prompt_ids: List[int],
         sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
+        image_data: Optional[List[Any]] = None,
+        video_data: Optional[List[Any]] = None,
     ) -> Any:
-        """Generate completions using V7.1 latency-aware scheduling
-
-        Overrides parent class method to use enhanced server selection logic
-        with latency awareness and token-based weighting.
-
+        """Generate completions with lock-free high-performance scheduling
+        
+        Optimized for high-concurrency short-request scenarios:
+        - Synchronous server selection (no await)
+        - Lock-free state management
+        - Minimal overhead in critical path
+        
         Args:
-            request_id: Unique request identifier.
-            prompt_ids: List of token IDs for the prompt.
-            sampling_params: Generation parameters (temperature, top_p, etc.).
-            image_data: Optional image data for multimodal generation.
-            video_data: Optional video data for multimodal generation.
-
+            request_id: Unique request identifier
+            prompt_ids: List of token IDs for the prompt
+            sampling_params: Generation parameters (temperature, top_p, etc.)
+            image_data: Optional image data for multimodal generation
+            video_data: Optional video data for multimodal generation
+            
         Returns:
-            Any: Generation result from the selected server.
+            Generation result from the selected server
         """
-        # Select optimal server using enhanced logic
-        entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
+        # Lock-free synchronous server selection (no await/lock overhead)
+        entry, weight = self._choose_server(request_id, prompt_ids=prompt_ids)
         start_time = time.time()
 
         try:
-            # Execute generation on the selected actor
+            # Execute generation on the selected actor (async remote call)
             result = await entry.actor.generate.remote(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
@@ -375,45 +374,44 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             )
             return result
         finally:
-            # Update metrics even if request fails
+            # Lock-free state updates (safe in single-threaded event loop)
             latency = time.time() - start_time
-            async with self._lock:
-                # Ensure non-negative values after decrement
-                entry.inflight_requests = max(0, entry.inflight_requests - 1)
-                entry.running_weight = max(0.0, entry.running_weight - weight)
-                entry.update_latency(latency)
+            # Ensure non-negative values (defensive programming)
+            entry.inflight_requests = max(0, entry.inflight_requests - 1)
+            entry.running_weight = max(0.0, entry.running_weight - weight)
+            entry.update_latency(latency)
 
     @rollout_trace_op
     async def generate_for_partial(
         self,
         request_id: str,
         *,
-        prompt_ids: list[int] | list[list[int]],
+        prompt_ids: List[int] | List[List[int]],
         sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-    ) -> tuple[Any, Any, Any] | tuple[Sequence[int], list[float], bool]:
-        """Generate partial completions with V7.1 scheduling
-
-        Specialized generation method for partial token streaming with
-        the same latency-aware scheduling as the main generate method.
-
+        image_data: Optional[List[Any]] = None,
+        video_data: Optional[List[Any]] = None,
+    ) -> Tuple[Any, Any, Any] | Tuple[Sequence[int], List[float], bool]:
+        """Generate partial completions with lock-free high-performance scheduling
+        
+        Specialized for partial token streaming with the same lock-free
+        optimization as the main generate method.
+        
         Args:
-            request_id: Unique request identifier.
-            prompt_ids: Token IDs (flat list or list of lists).
-            sampling_params: Generation parameters.
-            image_data: Optional image data for multimodal generation.
-            video_data: Optional video data for multimodal generation.
-
+            request_id: Unique request identifier
+            prompt_ids: Token IDs (flat list or list of lists)
+            sampling_params: Generation parameters
+            image_data: Optional image data for multimodal generation
+            video_data: Optional video data for multimodal generation
+            
         Returns:
-            Tuple: Partial generation result from the selected server.
+            Partial generation result from the selected server
         """
-        # Select optimal server using enhanced logic
-        entry, weight = await self._choose_server(request_id, prompt_ids=prompt_ids)
+        # Lock-free synchronous server selection
+        entry, weight = self._choose_server(request_id, prompt_ids=prompt_ids)
         start_time = time.time()
 
         try:
-            # Execute partial generation on the selected actor
+            # Execute partial generation on selected actor
             output = await entry.actor.generate_for_partial.remote(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
@@ -423,39 +421,11 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             )
             return output
         finally:
-            # Update metrics even if request fails
+            # Lock-free state updates with defensive checks
             latency = time.time() - start_time
-            async with self._lock:
-                # Ensure non-negative values after decrement
-                entry.inflight_requests = max(0, entry.inflight_requests - 1)
-                entry.running_weight = max(0.0, entry.running_weight - weight)
-                entry.update_latency(latency)
-
-    def _log_status_unsafe(self):
-        """Log server status snapshot (NOT thread-safe, must hold lock)
-
-        Generates a compact status summary showing inflight requests,
-        average latency, and effective load for each server instance.
-        """
-        # Calculate baseline latency for load normalization
-        valid_latencies = [e.avg_latency for e in self._entries if e.avg_latency > 0]
-        baseline_latency = min(valid_latencies) if valid_latencies else 1.0
-
-        # Build status string for each server
-        server_status_parts = []
-        for entry in self._entries:
-            adjusted_load = entry.effective_load(baseline_latency)
-            server_status_parts.append(
-                f"S{entry.index}({entry.inflight_requests}|{entry.avg_latency:5.1f}s|{adjusted_load:4.1f})"
-            )
-
-        # Calculate total system load
-        total_inflight = sum(e.inflight_requests for e in self._entries)
-
-        # Log consolidated status
-        logger.debug(
-            f"[Snapshot] Total={total_inflight} Base={baseline_latency:.2f}s | {' '.join(server_status_parts)}"
-        )
+            entry.inflight_requests = max(0, entry.inflight_requests - 1)
+            entry.running_weight = max(0.0, entry.running_weight - weight)
+            entry.update_latency(latency)
 
 
 # ==============================================

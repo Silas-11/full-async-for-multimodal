@@ -560,8 +560,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if enable_activation_offload:
             enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
 
-        log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
-
+        log_gpu_memory_usage(f"After {role} FSDP init")
+        aggressive_empty_cache(force_sync=True)
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -915,6 +915,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
             # perform training
+            aggressive_empty_cache(force_sync=True)
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
