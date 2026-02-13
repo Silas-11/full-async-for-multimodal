@@ -88,53 +88,36 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return output
 
 # ==============================================
-# Per-actor runtime load entry (V8.1 Simplified)
+# Per-actor runtime load entry (V8.2 Minimalist)
 # ==============================================
 class _ActorLoadEntry:
-    """Lightweight load tracker for individual actor instances
-    
-    Simplified tracking focused solely on concurrency and token weight.
-    Removed latency metrics to avoid misjudgment caused by long-tail requests.
-    Uses slots for memory efficiency.
-    """
-    __slots__ = (
-        "actor", "index", "inflight_requests", "running_weight", "max_concurrency",
-    )
+    """Minimalist tracker: only tracks inflight request count"""
+    __slots__ = ("actor", "index", "inflight_requests", "max_concurrency")
 
     def __init__(self, actor, index: int, max_concurrency: int):
-        """Initialize load tracking entry for an actor instance
-
-        Args:
-            actor: Actor/server instance to track
-            index: Unique identifier for the actor
-            max_concurrency: Maximum concurrent requests allowed
-        """
         self.actor = actor
         self.index = index
         self.inflight_requests: int = 0
-        self.running_weight: float = 0.0
         self.max_concurrency = max_concurrency
 
     def is_available(self) -> bool:
-        """Check if actor can accept additional requests
-        
-        Returns:
-            True if inflight requests are below max concurrency limit
-        """
         return self.inflight_requests < self.max_concurrency
 
-
 # ==============================================
-# Fully Async LLM Server Manager (V8.1 Weighted Least Connections)
+# Fully Async LLM Server Manager (V8.2 Two Random Choices)
 # ==============================================
 class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
-    """V8.1 Weighted Least Connections Async LLM Server Manager
+    """V8.2 Two Random Choices Strategy
     
-    Core Strategy:
-    1. Weighted Least Connections: Load = Inflight Requests + Prompt Weight
-    2. Lock-Free Design: Eliminates serialization bottlenecks for high concurrency
-    3. Latency-Agnostic: Removes latency penalties to prevent node misjudgment
-    4. Sticky Session with Fallback: Ensures cache hits without overloading nodes
+    Core Logic:
+    1. Pick 2 random servers.
+    2. Choose the one with lower inflight requests.
+    3. Fall back to round-robin if all servers are full.
+    
+    Why this works better for LLM:
+    - Avoids "Slow Request Trap" of Least-Connections.
+    - Distributes load evenly like Round-Robin but skips obviously full nodes.
+    - No weights, no latency history, pure and simple.
     """
 
     def __init__(
@@ -143,123 +126,66 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         server_handles: List[Any],
         *,
         max_concurrency_per_server: int = 32,
-        weight_alpha: float = 0.2,
         max_cache_size: int = 10000,
     ):
-        """Initialize the weighted least connections server manager
-        
-        Args:
-            config: Server configuration object
-            server_handles: List of actor/server handles to manage
-            max_concurrency_per_server: Max concurrent requests per server
-            weight_alpha: Scaling factor for token weight calculation (log2 based)
-            max_cache_size: Maximum size for request ID to entry cache
-        """
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
         
-        self.weight_alpha = weight_alpha
-        
-        # Lock-free design: state is managed via atomic operations in single-threaded event loop
         self._entries: List[_ActorLoadEntry] = [
             _ActorLoadEntry(actor, idx, max_concurrency_per_server) 
             for idx, actor in enumerate(self.server_handles)
         ]
+        # Pre-calculate indices for random choice to avoid range() overhead if possible, 
+        # but random.sample is fine.
+        self._num_servers = len(self._entries)
         
-        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(
-            maxsize=max_cache_size
-        )
-        
+        self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
         self._request_counter = 0
 
-    def _estimate_prompt_weight(self, prompt_ids) -> float:
-        """Estimate request weight based on token count (log-scaled)
+    def _choose_server(self, request_id: str, *, prompt_ids) -> _ActorLoadEntry:
+        """Synchronous O(1) server selection using Two Random Choices"""
         
-        Uses log2 scaling to handle wide variance in prompt lengths without
-        causing excessive penalty for long prompts.
-        
-        Args:
-            prompt_ids: List of token IDs or list of lists of token IDs
-            
-        Returns:
-            Calculated weight (0.0 for invalid/empty input)
-        """
-        if not prompt_ids:
-            return 0.0
-            
-        try:
-            if isinstance(prompt_ids[0], int):
-                total_tokens = len(prompt_ids)
-            else:
-                total_tokens = sum(len(p) for p in prompt_ids)
-        except (TypeError, IndexError):
-            return 0.0
-            
-        if total_tokens <= 0:
-            return 0.0
-            
-        return self.weight_alpha * math.log2(total_tokens + 1.0)
-
-    def _choose_server(self, request_id: str, *, prompt_ids) -> Tuple[_ActorLoadEntry, float]:
-        """Synchronous lock-free server selection using Weighted Least Connections
-        
-        Strategy:
-        1. Reuse sticky session if node is available (cache-aware)
-        2. Select node with minimum (inflight + weight)
-        3. Fallback to minimum inflight if all nodes are full
-        
-        Args:
-            request_id: Unique request identifier
-            prompt_ids: Token IDs for weight calculation
-            
-        Returns:
-            Tuple of (selected entry, calculated request weight)
-        """
-        request_weight = self._estimate_prompt_weight(prompt_ids)
-
         # 1. Sticky Session Check
         sticky_entry = self.request_id_to_entry.get(request_id)
         if sticky_entry is not None:
             if sticky_entry.is_available():
                 sticky_entry.inflight_requests += 1
-                sticky_entry.running_weight += request_weight
-                return sticky_entry, request_weight
+                return sticky_entry
             else:
-                # Fallback: sticky node is full, re-balance
                 self.request_id_to_entry.pop(request_id)
 
-        # 2. Load Balancing Selection
-        # Prioritize available nodes (have capacity)
-        available_entries = [e for e in self._entries if e.is_available()]
-        
-        if not available_entries:
-            # Degradation: all nodes full, select least busy to queue
-            available_entries = self._entries
+        # 2. Two Random Choices Algorithm
+        # 如果节点数少于2，直接选第一个（或仅有的那个）
+        if self._num_servers <= 1:
+            chosen_entry = self._entries[0]
+        else:
+            # 随机选两个不同的索引
+            idx1, idx2 = random.sample(range(self._num_servers), 2)
+            e1 = self._entries[idx1]
+            e2 = self._entries[idx2]
+            
+            # 简单比较 inflight (谁排队少选谁)
+            # 优先选 Available 的
+            if e1.is_available() and not e2.is_available():
+                chosen_entry = e1
+            elif not e1.is_available() and e2.is_available():
+                chosen_entry = e2
+            else:
+                # 都可用或都不可用，选 load 小的
+                chosen_entry = e1 if e1.inflight_requests <= e2.inflight_requests else e2
 
-        # Core Logic: Weighted Least Connections
-        # Effective Load = Inflight Requests + Running Weight
-        chosen_entry = min(
-            available_entries, 
-            key=lambda e: e.inflight_requests + e.running_weight
-        )
-
-        # Update state
+        # 3. 更新状态
         chosen_entry.inflight_requests += 1
-        chosen_entry.running_weight += request_weight
         self.request_id_to_entry[request_id] = chosen_entry
-
-        # Throttled logging
+        
+        # 4. 简易日志
         self._request_counter += 1
         if self._request_counter % 128 == 0:
             self._request_counter = 0
-            logger.info(
-                "[Dispatch] req=%s -> S%d (load=%.1f, inflight=%d)",
-                request_id[:6],
-                chosen_entry.index,
-                chosen_entry.running_weight,
-                chosen_entry.inflight_requests
-            )
+            # 仅打印选中的节点，方便调试
+            logger.info("[Dispatch] req=%s -> S%d (inflight=%d)", 
+                        request_id[:6], chosen_entry.index, chosen_entry.inflight_requests)
 
-        return chosen_entry, request_weight
+        return chosen_entry
 
     @rollout_trace_op
     async def generate(
@@ -271,20 +197,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         image_data: Optional[List[Any]] = None,
         video_data: Optional[List[Any]] = None,
     ) -> Any:
-        """Generate completions with weighted least-connections scheduling
-        
-        Args:
-            request_id: Unique request identifier
-            prompt_ids: List of token IDs for the prompt
-            sampling_params: Generation parameters
-            image_data: Optional image data
-            video_data: Optional video data
-            
-        Returns:
-            Generation result from the selected server
-        """
-        entry, weight = self._choose_server(request_id, prompt_ids=prompt_ids)
-
+        entry = self._choose_server(request_id, prompt_ids=prompt_ids)
         try:
             result = await entry.actor.generate.remote(
                 request_id=request_id,
@@ -295,9 +208,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             )
             return result
         finally:
-            # Atomic state rollback
             entry.inflight_requests = max(0, entry.inflight_requests - 1)
-            entry.running_weight = max(0.0, entry.running_weight - weight)
 
     @rollout_trace_op
     async def generate_for_partial(
@@ -309,20 +220,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         image_data: Optional[List[Any]] = None,
         video_data: Optional[List[Any]] = None,
     ) -> Tuple[Any, Any, Any] | Tuple[Sequence[int], List[float], bool]:
-        """Generate partial completions with weighted least-connections scheduling
-        
-        Args:
-            request_id: Unique request identifier
-            prompt_ids: Token IDs (flat or nested list)
-            sampling_params: Generation parameters
-            image_data: Optional image data
-            video_data: Optional video data
-            
-        Returns:
-            Partial generation result
-        """
-        entry, weight = self._choose_server(request_id, prompt_ids=prompt_ids)
-
+        entry = self._choose_server(request_id, prompt_ids=prompt_ids)
         try:
             output = await entry.actor.generate_for_partial.remote(
                 request_id=request_id,
@@ -333,15 +231,11 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             )
             return output
         finally:
-            # Atomic state rollback
             entry.inflight_requests = max(0, entry.inflight_requests - 1)
-            entry.running_weight = max(0.0, entry.running_weight - weight)
-
 
 # ==============================================
-# Main Entry Point (Environment Variable Control)
+# Main Entry Point
 # ==============================================
-# Dynamically select LLM server manager implementation based on environment variable
 try:
     use_balance_load = bool(int(os.environ.get("USE_BALANCE_LOAD", "0")))
 except (ValueError, TypeError):
@@ -350,10 +244,9 @@ except (ValueError, TypeError):
 
 if use_balance_load:
     FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
-    logger.info("Using V8.1 Weighted Least Connections FullyAsyncLLMServerManager")
+    logger.info("Using V8.2 Two Random Choices FullyAsyncLLMServerManager")
 else:
     logger.info("Using base FullyAsyncLLMServerManager implementation")
-
 
 @ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
