@@ -243,6 +243,12 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             return output
         finally:
             entry.inflight_requests = max(0, entry.inflight_requests - 1)
+    def get_server_loads(self) -> List[int]:
+        """
+        Return the current inflight request count for each server.
+        Used for monitoring.
+        """
+        return [entry.inflight_requests for entry in self._entries]
 
 # ==============================================
 # Main Entry Point

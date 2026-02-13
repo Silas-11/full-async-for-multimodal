@@ -699,6 +699,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
+             # === 新增：各节点负载监控 ===
+            "monitor/server_loads": self.async_rollout_manager.get_server_loads(),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/cancel_queue_size": self.cancel_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
