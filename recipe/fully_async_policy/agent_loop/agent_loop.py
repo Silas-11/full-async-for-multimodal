@@ -528,5 +528,21 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
-    def get_server_loads(self) -> List[int]:
-        return self.agent_loop_workers[0].get_server_loads().remote()
+    async def get_server_loads(self) -> List[int]:
+        worker_refs = [
+            worker.get_server_loads.remote()
+            for worker in self.agent_loop_workers
+        ]
+
+        worker_loads_list = await asyncio.gather(
+            *[asyncio.wrap_future(ref.future()) for ref in worker_refs]
+        )
+
+        # 聚合
+        aggregated = [0] * len(self.server_handles)
+
+        for loads in worker_loads_list:
+            for i, val in enumerate(loads):
+                aggregated[i] += val
+
+        return aggregated
