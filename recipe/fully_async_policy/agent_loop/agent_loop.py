@@ -397,6 +397,8 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
     async def resume_agent_loops(self):
         """Clear the shared cancellation event."""
         self.cancellation_event.clear()
+    def get_server_loads(self) -> List[int]:
+        return self.server_manager.get_server_loads()
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
@@ -520,3 +522,5 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+    def get_server_loads(self) -> List[int]:
+        return self.agent_loop_workers[0].get_server_loads()
