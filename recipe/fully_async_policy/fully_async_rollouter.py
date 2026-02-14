@@ -632,7 +632,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # Print statistics periodically
             current_time = time.time()
             if current_time - last_stats_time >= stats_interval:
-                stats = await self.get_statistics()
+                stats = await self.get_statistics_server_loads()
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
@@ -699,8 +699,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
-             # === 新增：各节点负载监控 ===
-            "monitor/server_loads": await self.async_rollout_manager.get_server_loads(),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/cancel_queue_size": self.cancel_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
@@ -716,5 +714,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
+
+        return stats
+    async def get_statistics_server_loads(self) -> dict:
+
+        stats = await self.get_statistics_light()
+
+        # 只有 monitor 会触发这条 RPC
+        stats["monitor/server_loads"] = await self.async_rollout_manager.get_server_loads()
 
         return stats
