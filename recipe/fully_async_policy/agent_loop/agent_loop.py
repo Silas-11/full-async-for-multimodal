@@ -218,7 +218,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
         
         # --- 1. 参数提取 (使用 config. 直接访问) ---
-        num_workers = config.actor_rollout_ref.rollout.num_workers
+        num_workers = config.actor_rollout_ref.rollout.agent.num_workers
         n_responses = config.actor_rollout_ref.rollout.n
         
         # 业务配置
@@ -255,21 +255,21 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         # 防止除零
         if num_workers <= 0: num_workers = 1
         
-        # 计算公式：(全局并发上限 * N) / Worker数 * 系数
-        threshold = (global_max_samples * n_responses / num_workers) * SAFETY_FACTOR
+        # 计算公式：(全局并发上限 * N) / Worker数 /server数 * 系数
+        threshold = (global_max_samples * n_responses / num_workers / num_servers) * SAFETY_FACTOR
         
         # 向下取整，且至少为 1
-        final_threshold = max(1, int(threshold))
+        max_concurrency_per_server = max(1, int(threshold))
         
         print(
             f"[Init Threshold] Global Max Samples: {global_max_samples}. "
             f"Workers: {num_workers}. "
             f"Factor: {SAFETY_FACTOR}. "
-            f"Final Threshold Per Worker: {final_threshold}"
+            f"Final Threshold Per Worker: {max_concurrency_per_server}"
         )
 
         self._entries: List[_ActorLoadEntry] = [
-            _ActorLoadEntry(actor, idx, final_threshold) 
+            _ActorLoadEntry(actor, idx, max_concurrency_per_server) 
             for idx, actor in enumerate(self.server_handles)
         ]
         self._num_servers = num_servers
