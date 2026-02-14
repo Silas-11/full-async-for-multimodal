@@ -212,21 +212,69 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         config: Any,
         server_handles: List[Any],
         *,
-        # Default to 16 as per your system constraint
         max_concurrency_per_server: int = 16, 
         max_cache_size: int = 10000,
     ):
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
         
+        # --- 1. 参数提取 (使用 config. 直接访问) ---
+        num_workers = config.actor_rollout_ref.rollout.num_workers
+        n_responses = config.actor_rollout_ref.rollout.n
+        
+        # 业务配置
+        require_batches = config.async_training.require_batches
+        staleness_threshold = config.async_training.staleness_threshold
+        trigger_sync_step = config.async_training.trigger_parameter_sync_step
+        ppo_mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
+        
+        num_servers = len(server_handles)
+
+        # --- 2. 计算全局最大样本容量 ---
+        
+        # A. 期望并发上限 (每 Server 16 个 Sample)
+        desired_limit_samples = num_servers * 16
+        
+        # B. 业务逻辑上限 (基于 staleness 计算)
+        required_samples = ppo_mini_batch_size * require_batches
+        business_limit_samples = int(
+            required_samples
+            * (staleness_threshold + 1)
+            * trigger_sync_step
+        )
+        
+        # 取最小值作为全局基准
+        global_max_samples = min(desired_limit_samples, business_limit_samples)
+        
+        # --- 3. 计算单 Worker 阈值 ---
+        
+        # 设置为 1.5：
+        # 允许 Server 在负载不均时，承担比平均份额多 50% 的请求。
+        # 前提：global_max_samples 应小于硬件真实 OOM 极限。
+        SAFETY_FACTOR = 1.5 
+        
+        # 防止除零
+        if num_workers <= 0: num_workers = 1
+        
+        # 计算公式：(全局并发上限 * N) / Worker数 * 系数
+        threshold = (global_max_samples * n_responses / num_workers) * SAFETY_FACTOR
+        
+        # 向下取整，且至少为 1
+        final_threshold = max(1, int(threshold))
+        
+        print(
+            f"[Init Threshold] Global Max Samples: {global_max_samples}. "
+            f"Workers: {num_workers}. "
+            f"Factor: {SAFETY_FACTOR}. "
+            f"Final Threshold Per Worker: {final_threshold}"
+        )
+
         self._entries: List[_ActorLoadEntry] = [
-            _ActorLoadEntry(actor, idx, max_concurrency_per_server) 
+            _ActorLoadEntry(actor, idx, final_threshold) 
             for idx, actor in enumerate(self.server_handles)
         ]
-        self._num_servers = len(self._entries)
+        self._num_servers = num_servers
         
-        # Pointer for Round Robin
         self._rr_index = 0
-        
         self.request_id_to_entry: LRUCache[str, _ActorLoadEntry] = LRUCache(maxsize=max_cache_size)
         self._request_counter = 0
 
@@ -262,6 +310,14 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         
         # 3. Fallback: All nodes are full/overloaded
         if chosen_entry is None:
+            # 【新增】当没有可用节点时，打印当前所有节点的负载情况
+            # 这是一个重要的告警信号，说明系统已满载
+            loads = [e.inflight_requests for e in self._entries]
+            print(
+                "[Dispatch V8.3] All servers are at max capacity! "
+                "Current Load: %s. Picking least loaded server.", 
+                loads
+            )
             # This case should theoretically not happen often due to global limits,
             # but we handle it by picking the "least bad" option.
             chosen_entry = min(self._entries, key=lambda e: e.inflight_requests)
@@ -276,7 +332,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             self._request_counter = 0
             # Log current load distribution
             loads = [e.inflight_requests for e in self._entries]
-            logger.info("[Dispatch V8.3] req=%s -> S%d. Current Load: %s", 
+            print("[Dispatch V8.3] req=%s -> S%d. Current Load: %s", 
                         request_id[:6], chosen_entry.index, loads)
 
         return chosen_entry
