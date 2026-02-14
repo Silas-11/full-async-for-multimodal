@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import heapq
 import logging
 import math
 import os
@@ -50,48 +51,124 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
-    """Base implementation of fully async LLM server manager"""
+    """
+    Old weighted-heap scheduling
+    Inflight tracking aligned 100% with FullyAsyncLLMServerManagerBalance
+    """
 
+    def __init__(
+        self,
+        config: Any,
+        server_handles: List[Any],
+        *,
+        max_cache_size: int = 10000,
+    ):
+        super().__init__(config, server_handles, max_cache_size=max_cache_size)
+
+        # Real inflight tracking (same semantics as Balance)
+        self._inflight_requests: List[int] = [0] * len(self.server_handles)
+
+        # O(1) mapping
+        self._server_to_index = {
+            actor: idx for idx, actor in enumerate(self.server_handles)
+        }
+
+    # ==========================================================
+    # Old heap-based scheduling (UNCHANGED scheduling logic)
+    # But inflight++ moved here to match V8.3 structure
+    # ==========================================================
+    def _choose_server(self, request_id: str):
+
+        if request_id in self.request_id_to_server:
+            server = self.request_id_to_server[request_id]
+            server_index = self._server_to_index[server]
+            self._inflight_requests[server_index] += 1
+            return server
+
+        _, _, server = self.weighted_serveres[0]
+
+        # heap weighted logic unchanged
+        self.weighted_serveres[0][0] += 1
+        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
+
+        self.request_id_to_server[request_id] = server
+
+        server_index = self._server_to_index[server]
+        self._inflight_requests[server_index] += 1
+
+        return server
+
+    # ==========================================================
+    # Generate (same pattern as V8.3)
+    # ==========================================================
+    @rollout_trace_op
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: List[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[List[Any]] = None,
+        video_data: Optional[List[Any]] = None,
+    ) -> Any:
+
+        server = self._choose_server(request_id)
+        server_index = self._server_to_index[server]
+
+        try:
+            result = await server.generate.remote(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return result
+
+        finally:
+            self._inflight_requests[server_index] = max(
+                0,
+                self._inflight_requests[server_index] - 1,
+            )
+
+    # ==========================================================
+    # Partial (IDENTICAL inflight semantics to V8.3)
+    # ==========================================================
     @rollout_trace_op
     async def generate_for_partial(
         self,
         request_id: str,
         *,
-        prompt_ids: list[int],
+        prompt_ids: List[int] | List[List[int]],
         sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-    ) -> tuple[list[Any], list[Any], Any] | tuple[Sequence[int], list[float], bool]:
-        """Generate tokens from prompt ids, used for async partial.
+        image_data: Optional[List[Any]] = None,
+        video_data: Optional[List[Any]] = None,
+    ):
 
-        Args:
-            request_id (str): Request ID for sticky session.
-            prompt_ids (List[int]): List of prompt token IDs.
-            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
-            image_data (Optional[List[Any]]): Optional image data for multimodal generation.
-            video_data (Optional[List[Any]]): Optional video data for multimodal generation.
-
-        Returns:
-            Tuple: Generation output containing:
-                - Element 0 (Sequence[int]): Generated response token IDs.
-                - Element 1 (List[float]): Log probabilities for the response token IDs.
-                - Element 2 (bool): Flag indicating cancellation status.
-        """
         server = self._choose_server(request_id)
-        output = await server.generate_for_partial.remote(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            video_data=video_data,
-        )
-        return output
+        server_index = self._server_to_index[server]
+
+        try:
+            output = await server.generate_for_partial.remote(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return output
+
+        finally:
+            self._inflight_requests[server_index] = max(
+                0,
+                self._inflight_requests[server_index] - 1,
+            )
+
+    # ==========================================================
+    # Monitoring
+    # ==========================================================
     def get_server_loads(self) -> List[int]:
-        """
-        Return the current inflight request count for each server.
-        Used for monitoring.
-        """
-        return [entry[0] for entry in self.weighted_serveres]
+        return list(self._inflight_requests)
 
 # Assuming AsyncLLMServerManager is defined in the same file or imported
 # from .base import AsyncLLMServerManager 
