@@ -718,7 +718,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         return stats
     async def get_statistics_server_loads(self) -> dict:
 
-        stats = await self.get_statistics_light()
+        stats = await self.get_statistics()
 
         # 只有 monitor 会触发这条 RPC
         stats["monitor/server_loads"] = await self.async_rollout_manager.get_server_loads()
