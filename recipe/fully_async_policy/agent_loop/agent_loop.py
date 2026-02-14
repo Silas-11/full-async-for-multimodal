@@ -86,6 +86,12 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             video_data=video_data,
         )
         return output
+    def get_server_loads(self) -> List[int]:
+        """
+        Return the current inflight request count for each server.
+        Used for monitoring.
+        """
+        return [entry[0] for entry in self.weighted_serveres]
 
 # Assuming AsyncLLMServerManager is defined in the same file or imported
 # from .base import AsyncLLMServerManager 
@@ -523,4 +529,4 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
     def get_server_loads(self) -> List[int]:
-        return self.agent_loop_workers[0].get_server_loads()
+        return self.agent_loop_workers[0].get_server_loads().remote()
