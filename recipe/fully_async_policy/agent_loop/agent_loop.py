@@ -247,10 +247,10 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         
         # --- 3. 计算单 Worker 阈值 ---
         
-        # 设置为 1.5：
-        # 允许 Server 在负载不均时，承担比平均份额多 50% 的请求。
+        # 设置为 1.2：
+        # 允许 Server 在负载不均时，承担比平均份额多 20% 的请求。
         # 前提：global_max_samples 应小于硬件真实 OOM 极限。
-        SAFETY_FACTOR = 1.5 
+        SAFETY_FACTOR = 1.25 
         
         # 防止除零
         if num_workers <= 0: num_workers = 1
@@ -314,9 +314,8 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             # 这是一个重要的告警信号，说明系统已满载
             loads = [e.inflight_requests for e in self._entries]
             print(
-                "[Dispatch V8.3] All servers are at max capacity! "
-                "Current Load: %s. Picking least loaded server.", 
-                loads
+                f"[Dispatch] All servers are at max capacity! "
+                f"Current Load: {loads}. Picking least loaded server."
             )
             # This case should theoretically not happen often due to global limits,
             # but we handle it by picking the "least bad" option.
@@ -332,8 +331,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
             self._request_counter = 0
             # Log current load distribution
             loads = [e.inflight_requests for e in self._entries]
-            print("[Dispatch V8.3] req=%s -> S%d. Current Load: %s", 
-                        request_id[:6], chosen_entry.index, loads)
+            print(f"[Dispatch] req={request_id[:6]} -> S{chosen_entry.index}. Current Load: {loads}")
 
         return chosen_entry
 
