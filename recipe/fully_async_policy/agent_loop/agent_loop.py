@@ -307,6 +307,9 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
                 # Update next start index to the NEXT node (standard RR behavior)
                 self._rr_index = (idx + 1) % self._num_servers
                 break
+            else:
+                # Skip to the next node
+                print(f"[Dispatch] server {entry.index} is full, skipping to next node")
         
         # 3. Fallback: All nodes are full/overloaded
         if chosen_entry is None:
