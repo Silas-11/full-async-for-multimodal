@@ -170,93 +170,43 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 # ==============================================
 
 DEFAULT_MAX_CACHE_SIZE = 10000
-DEFAULT_EMA_DECAY = 0.1  # Higher = more sensitive to recent samples
-DEFAULT_RT_WEIGHT = 0.3  # Response time weight in composite score
-DEFAULT_OVERFLOW_RATIO = 1.25  # Trigger protection when active > theory * ratio
-LOG_INTERVAL = 128  # Log load status every N requests
+DEFAULT_EMA_DECAY = 0.1
+DEFAULT_RT_WEIGHT = 0.3
+DEFAULT_OVERFLOW_RATIO = 1.25
+DEFAULT_IDLE_RESET_THRESHOLD = 1  # seconds of continuous idle before EMA decay
+DEFAULT_IDLE_DECAY_FACTOR = 0.01  # strong decay when idle reset triggered
 
-
-# ==============================================
-# Server State
-# ==============================================
+LOG_INTERVAL = 128
 
 
 @dataclass
 class ServerState:
-    """
-    Runtime state for a single vLLM server.
-
-    Only two effective signals are maintained:
-    - active: Real-time concurrent request count (decremented on completion)
-    - ema_rt: Exponential moving average of response time (reflects server speed)
-    """
-
     index: int
     actor: Any
 
-    active: int = 0  # Real-time inflight request count
-    ema_rt: float = 1.0  # Response time EMA (seconds), initial 1.0 = no prior
-    total_requests: int = 0  # Cumulative request count (for monitoring)
-    total_time: float = 0.0  # Cumulative time (for monitoring)
+    active: int = 0
+    ema_rt: float = 1.0
+    total_requests: int = 0
+    total_time: float = 0.0
 
     def update_rt(self, response_time: float, decay: float) -> None:
-        """Update EMA response time after request completion."""
         self.ema_rt = decay * response_time + (1 - decay) * self.ema_rt
-        self.ema_rt = max(self.ema_rt, 1e-3)  # Prevent approaching zero
+        self.ema_rt = max(self.ema_rt, 1e-3)
 
     def load_score(self, global_avg_rt: float, rt_weight: float) -> float:
-        """
-        Calculate composite load score (lower is better).
-
-        Formula:
-            score = (1 - rt_weight) * active + rt_weight * active * (ema_rt / global_avg_rt)
-
-        Derivation:
-        - Base term is active (real-time concurrent count)
-        - Multiplied by rt_weight * (ema_rt / global_avg_rt) as penalty for slow servers
-        - When all servers have same ema_rt, rt_ratio=1, score degenerates to pure active sorting
-        - When a server is persistently slow, rt_ratio > 1, its score is amplified
-        - rt_weight=0 completely degenerates to real-time active sorting
-
-        Args:
-            global_avg_rt: Global average response time for normalization.
-            rt_weight: Weight for response time penalty (0.0 ~ 0.5).
-
-        Returns:
-            Composite load score (lower is better).
-        """
         if global_avg_rt <= 0:
             return float(self.active)
 
         rt_ratio = self.ema_rt / global_avg_rt
         score = (1 - rt_weight) * self.active + rt_weight * self.active * rt_ratio
-
-        # active=0 servers have score=0, naturally prioritized
         return score
 
 
 # ==============================================
-# Main Load Balancer Class
+# Main Load Balancer
 # ==============================================
 
-
 class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
-    """
-    Optimized Load Balancer: Real-time Active + EMA RT + Threshold Protection.
-
-    Improvements over Original Scheme:
-    1. Corrected counting semantics: active inflight, decrement on completion
-       (Original: monotonic increment, degenerates to round-robin)
-    2. EMA response time: Identifies persistently slow servers (effective in service deployment)
-    3. Threshold protection: Fallback to pure active sorting under global overload
-    4. Stable sticky sessions: Only break when server is unavailable (KV cache priority)
-    5. Behaves identically to original round-robin under balanced load (no additional risk)
-
-    Abandoned V10 Designs:
-    - effective_load (exponential decay progress estimation, incompatible with LLM autoregressive generation)
-    - Variance-driven strategy switching (based on distorted effective_load, unreliable)
-    - Aggressive sticky session breaking (KV cache benefit > minor load imbalance cost)
-    """
 
     def __init__(
         self,
@@ -267,18 +217,10 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         ema_decay: float = DEFAULT_EMA_DECAY,
         rt_weight: float = DEFAULT_RT_WEIGHT,
         overflow_ratio: float = DEFAULT_OVERFLOW_RATIO,
+        idle_reset_threshold: float = DEFAULT_IDLE_RESET_THRESHOLD,
+        idle_decay_factor: float = DEFAULT_IDLE_DECAY_FACTOR,
     ) -> None:
-        """
-        Initialize the optimized load balancer.
 
-        Args:
-            config: Global configuration object (OmegaConf DictConfig format).
-            server_handles: List of Ray Actor handles for vLLM server replicas.
-            max_cache_size: Maximum size for sticky session LRU cache.
-            ema_decay: EMA decay factor for response time updates (0.05 ~ 0.3).
-            rt_weight: Response time weight in composite score (0.0 ~ 0.5).
-            overflow_ratio: Threshold ratio for overload protection (1.0 ~ 2.0).
-        """
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
 
         self.ema_decay = ema_decay
@@ -286,25 +228,32 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         self.overflow_ratio = overflow_ratio
         self.num_servers = len(server_handles)
 
-        # Server state table
+        self.idle_reset_threshold = idle_reset_threshold
+        self.idle_decay_factor = idle_decay_factor
+
         self.states: dict[int, ServerState] = {
-            idx: ServerState(index=idx, actor=actor) for idx, actor in enumerate(self.server_handles)
+            idx: ServerState(index=idx, actor=actor)
+            for idx, actor in enumerate(self.server_handles)
         }
 
-        # Actor handle -> index, O(1) reverse lookup
-        self._actor_to_idx: dict[Any, int] = {actor: idx for idx, actor in enumerate(self.server_handles)}
+        self._actor_to_idx = {
+            actor: idx for idx, actor in enumerate(self.server_handles)
+        }
 
-        # Sticky session cache: request_id -> ServerState
-        # Reuse parent class LRU cache key space, but store ServerState instead of actor handle
         self.request_id_to_state: LRUCache = LRUCache(maxsize=max_cache_size)
 
-        # Monitoring
         self._request_counter = 0
+
+        # idle detection
+        self._last_active_timestamp = time.monotonic()
+        self._ema_idle_reset_done = False
 
         print(
             f"[Balance Init] servers={self.num_servers}, "
             f"ema_decay={ema_decay}, rt_weight={rt_weight}, "
-            f"overflow_ratio={overflow_ratio}"
+            f"overflow_ratio={overflow_ratio}, "
+            f"idle_reset_threshold={idle_reset_threshold}, "
+            f"idle_decay_factor={idle_decay_factor}"
         )
 
     # ==============================================
@@ -312,50 +261,40 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     # ==============================================
 
     def _global_avg_rt(self) -> float:
-        """Calculate global average EMA RT across all servers for rt_ratio normalization."""
         return sum(s.ema_rt for s in self.states.values()) / max(self.num_servers, 1)
 
     def _theory_per_server(self) -> float:
-        """
-        Calculate theoretical uniform concurrent count per server.
-
-        Formula: total_active / num_servers
-
-        This is dynamically calculated without external configuration dependencies.
-        Corresponds to document formula: total_sample/num_workers*n/num_servers
-
-        Returns:
-            Theoretical average active requests per server.
-        """
         total = sum(s.active for s in self.states.values())
         return total / max(self.num_servers, 1)
 
-    def _get_max_active(self) -> int:
-        """
-        Get maximum allowed active requests per server.
+    def _total_active(self) -> int:
+        return sum(s.active for s in self.states.values())
 
-        Currently uses a simple heuristic: theory * overflow_ratio.
-        Can be extended with configuration-based limits if needed.
+    # ==============================================
+    # Idle Reset Logic
+    # ==============================================
 
-        Returns:
-            Maximum active requests per server.
-        """
-        theory = self._theory_per_server()
-        return max(1, int(theory * self.overflow_ratio))
+    def _decay_ema_on_idle(self) -> None:
+        # 问题1修复：直接重置到 1.0，下一个 step 各 Server 完全均等
+        # idle_decay_factor=0.01 使得 ema_rt * 0.01 远小于 1.0，max(1.0, ...) 保证下限
+        for state in self.states.values():
+            state.ema_rt = max(1.0, state.ema_rt * self.idle_decay_factor)
+
+        print("[Balance] Idle detected → EMA decayed")
+
+    def _maybe_idle_reset(self) -> None:
+        # 此方法在 active 已经 +1 之后调用，total_active 必然 > 0
+        # 因此只需检查距上次归零的时间，不存在 active=0 的竞态窗口
+        idle_time = time.monotonic() - self._last_active_timestamp
+        if idle_time >= self.idle_reset_threshold and not self._ema_idle_reset_done:
+            self._decay_ema_on_idle()
+            self._ema_idle_reset_done = True
+
+    # ==============================================
+    # Scheduling Core
+    # ==============================================
 
     def _best_state(self) -> ServerState:
-        """
-        Core scheduling logic: select server with lowest composite score.
-
-        Process:
-        1. Calculate load_score for each server
-        2. Select candidate with lowest score (best)
-        3. Threshold check: if best.active > theory * overflow_ratio,
-           all servers are under high load, fallback to pure active minimum (safeguard)
-
-        Returns:
-            Selected ServerState instance.
-        """
         global_avg = self._global_avg_rt()
         theory = self._theory_per_server()
         threshold = theory * self.overflow_ratio
@@ -369,57 +308,37 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
                 best_score = score
                 best = state
 
-        assert best is not None, "No server available"
+        assert best is not None
 
-        # Threshold protection: if best is still overloaded, global high load detected
-        # Fallback to pure active minimum sorting (rt_weight penalty may not be optimal here)
         if best.active > threshold and theory > 0:
             best = min(self.states.values(), key=lambda s: s.active)
 
         return best
 
     # ==============================================
-    # Scheduling Entry Points
+    # Scheduling Entry
     # ==============================================
 
-    def _choose_server(
-        self,
-        request_id: str,
-        prompt_ids: Optional[list[int]] = None,
-    ) -> ServerState:
-        """
-        Select server and update active count (+1).
+    def _choose_server(self, request_id: str, prompt_ids=None) -> ServerState:
 
-        Priority:
-        1. Sticky session: request_id already bound, and corresponding server active > 0
-           Note: Do not actively break sticky sessions, KV cache benefit priority
-        2. Composite score scheduling: server with lowest load_score
-
-        Args:
-            request_id: Unique request identifier for sticky session lookup.
-            prompt_ids: Optional prompt token IDs (for future enhancements).
-
-        Returns:
-            Selected ServerState instance.
-        """
-        # 1. Sticky session
+        # 问题2修复：粘性会话保留原始方案逻辑，不主动打破，KV Cache 收益优先
         if request_id in self.request_id_to_state:
             state = self.request_id_to_state[request_id]
-            # Check if sticky server is still available (not overloaded)
-            if state.active < self._get_max_active():
-                state.active += 1
-                return state
-            else:
-                # Sticky server overloaded, remove sticky and reselect
-                self.request_id_to_state.pop(request_id, None)
+            state.active += 1
+            # 问题3&4修复：active +1 之后再清除 flag，消除 active=0 的竞态窗口
+            self._ema_idle_reset_done = False
+            self._maybe_idle_reset()
+            return state
 
-        # 2. Composite score scheduling
         state = self._best_state()
         state.active += 1
         state.total_requests += 1
         self.request_id_to_state[request_id] = state
 
-        # Monitoring log
+        # 问题3&4修复：active +1 之后再清除 flag 并检测 idle reset
+        self._ema_idle_reset_done = False
+        self._maybe_idle_reset()
+
         self._request_counter += 1
         if self._request_counter % LOG_INTERVAL == 0:
             self._log_status()
@@ -427,96 +346,38 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         return state
 
     def _release(self, state: ServerState, response_time: float) -> None:
-        """
-        Request completion callback: decrement active and update EMA RT.
-
-        Called in finally block to ensure count leakage prevention under exceptions.
-
-        Args:
-            state: ServerState for the server that handled the request.
-            response_time: Measured response time in seconds.
-        """
         state.active = max(0, state.active - 1)
         state.total_time += response_time
         state.update_rt(response_time, self.ema_decay)
+
+        # 问题3修复：记录 active 归零的时间点，供 _maybe_idle_reset 计算 idle_time
+        # 只在归零时更新，避免被中间的 release 覆盖
+        if self._total_active() == 0:
+            self._last_active_timestamp = time.monotonic()
 
     # ==============================================
     # Public APIs
     # ==============================================
 
     @rollout_trace_op
-    async def generate(
-        self,
-        request_id: str,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-    ) -> Any:
-        """
-        Generate response tokens for the given prompt.
-
-        Args:
-            request_id: Unique identifier for request tracking and sticky session.
-            prompt_ids: Token IDs of the input prompt.
-            sampling_params: Generation parameters (temperature, top_p, etc.).
-            image_data: Optional image data for multimodal models.
-            video_data: Optional video data for multimodal models.
-
-        Returns:
-            TokenOutput containing generated tokens and metadata.
-        """
-        state = self._choose_server(request_id, prompt_ids=prompt_ids)
-        start = time.monotonic()  # Use monotonic to avoid system clock jumps
+    async def generate(self, request_id: str, **kwargs):
+        state = self._choose_server(request_id)
+        start = time.monotonic()
 
         try:
-            result = await state.actor.generate.remote(
-                request_id=request_id,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-            )
-            return result
+            return await state.actor.generate.remote(request_id=request_id, **kwargs)
         finally:
             self._release(state, time.monotonic() - start)
 
     @rollout_trace_op
-    async def generate_for_partial(
-        self,
-        request_id: str,
-        *,
-        prompt_ids: list[int] | list[list[int]],
-        sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-    ) -> Any:
-        """
-        Generate partial responses for rollout continuation.
-
-        Args:
-            request_id: Unique identifier for request tracking.
-            prompt_ids: Token IDs of the input prompt(s).
-            sampling_params: Generation parameters.
-            image_data: Optional image data for multimodal models.
-            video_data: Optional video data for multimodal models.
-
-        Returns:
-            Tuple containing output tokens, log probabilities, and completion status.
-        """
-        state = self._choose_server(request_id, prompt_ids=prompt_ids)
+    async def generate_for_partial(self, request_id: str, **kwargs):
+        state = self._choose_server(request_id)
         start = time.monotonic()
 
         try:
-            output = await state.actor.generate_for_partial.remote(
-                request_id=request_id,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
+            return await state.actor.generate_for_partial.remote(
+                request_id=request_id, **kwargs
             )
-            return output
         finally:
             self._release(state, time.monotonic() - start)
 
@@ -525,38 +386,16 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     # ==============================================
 
     def get_server_loads(self) -> list[int]:
-        """
-        Compatible with original interface, return real-time active count per server.
-
-        Returns:
-            List of active request counts for each server.
-        """
         return [self.states[i].active for i in range(self.num_servers)]
 
     def get_load_metrics(self) -> dict[str, Any]:
-        """
-        Detailed monitoring metrics for external metrics system collection.
-
-        Returns:
-            Dictionary containing:
-            - active: Per-server active request counts
-            - ema_rt: Per-server EMA response times
-            - total_requests: Per-server cumulative request counts
-            - global_avg_rt: Global average response time
-            - rt_weight: Current response time weight configuration
-            - overflow_ratio: Current overflow ratio configuration
-        """
         return {
             "active": {i: s.active for i, s in self.states.items()},
             "ema_rt": {i: round(s.ema_rt, 3) for i, s in self.states.items()},
-            "total_requests": {i: s.total_requests for i, s in self.states.items()},
             "global_avg_rt": round(self._global_avg_rt(), 3),
-            "rt_weight": self.rt_weight,
-            "overflow_ratio": self.overflow_ratio,
         }
 
     def _log_status(self) -> None:
-        """Log current load distribution status (called every LOG_INTERVAL requests)."""
         metrics = self.get_load_metrics()
         print(
             f"[Balance] active={metrics['active']} | "
