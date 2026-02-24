@@ -2,7 +2,7 @@ ENGINE=${1:-vllm}
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
 # replace with your own model path and data path
-HF_MODEL_PATH=/mnt/chubao/lujiawei30/hw_dwq/full_async/ckpt/Qwen3-8B-Instruct
+HF_MODEL_PATH=/mnt/chubao/lujiawei30/hw_dwq/full_async/ckpt/Qwen3-4B-Instruct
 train_path=/mnt/chubao/lujiawei30/hw_dwq/full_async/data/gsm8k/train.parquet
 test_path=/mnt/chubao/lujiawei30/hw_dwq/full_async/data/gsm8k/test.parquet
 
@@ -76,7 +76,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.critic_warmup=0 \
     trainer.logger='["console"]' \
     trainer.project_name='verl_grpo_example_gsm8k' \
-    trainer.experiment_name='qwen3_8b_fsdp_async' \
+    trainer.experiment_name='qwen3_4b_fsdp_async' \
     trainer.test_freq="${test_freq}" \
     trainer.total_epochs="${total_epochs}" \
     trainer.val_before_train=False \

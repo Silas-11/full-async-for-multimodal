@@ -301,7 +301,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         # Monitoring
         self._request_counter = 0
 
-        logger.info(
+        print(
             f"[Balance Init] servers={self.num_servers}, "
             f"ema_decay={ema_decay}, rt_weight={rt_weight}, "
             f"overflow_ratio={overflow_ratio}"
@@ -558,7 +558,7 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     def _log_status(self) -> None:
         """Log current load distribution status (called every LOG_INTERVAL requests)."""
         metrics = self.get_load_metrics()
-        logger.info(
+        print(
             f"[Balance] active={metrics['active']} | "
             f"ema_rt={metrics['ema_rt']} | "
             f"global_avg_rt={metrics['global_avg_rt']}"
@@ -581,9 +581,9 @@ def _should_use_balance_load() -> bool:
 
 if _should_use_balance_load():
     FullyAsyncLLMServerManager = FullyAsyncLLMServerManagerBalance
-    logger.info("Using optimized FullyAsyncLLMServerManagerBalance")
+    print("Using optimized FullyAsyncLLMServerManagerBalance")
 else:
-    logger.info("Using base FullyAsyncLLMServerManager")
+    print("Using base FullyAsyncLLMServerManager")
 
 
 @ray.remote
