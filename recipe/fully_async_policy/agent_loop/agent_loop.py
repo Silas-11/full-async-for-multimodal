@@ -170,11 +170,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 # ==============================================
 
 DEFAULT_MAX_CACHE_SIZE = 10000
-DEFAULT_EMA_DECAY = 0.1
-DEFAULT_RT_WEIGHT = 0.3
 DEFAULT_OVERFLOW_RATIO = 1.25
-DEFAULT_IDLE_RESET_THRESHOLD = 1  # seconds of continuous idle before EMA decay
-DEFAULT_IDLE_DECAY_FACTOR = 0.01  # strong decay when idle reset triggered
 
 LOG_INTERVAL = 128
 
@@ -185,21 +181,8 @@ class ServerState:
     actor: Any
 
     active: int = 0
-    ema_rt: float = 1.0
     total_requests: int = 0
     total_time: float = 0.0
-
-    def update_rt(self, response_time: float, decay: float) -> None:
-        self.ema_rt = decay * response_time + (1 - decay) * self.ema_rt
-        self.ema_rt = max(self.ema_rt, 1e-3)
-
-    def load_score(self, global_avg_rt: float, rt_weight: float) -> float:
-        if global_avg_rt <= 0:
-            return float(self.active)
-
-        rt_ratio = self.ema_rt / global_avg_rt
-        score = (1 - rt_weight) * self.active + rt_weight * self.active * rt_ratio
-        return score
 
 
 # ==============================================
@@ -207,6 +190,19 @@ class ServerState:
 # ==============================================
 
 class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
+    """
+    实时并发数 + 阈值保护负载均衡器。
+
+    相比原始方案的改进：
+    - 计数语义修正：active inflight，请求完成后 -1（原始方案只增不减，退化为轮询）
+    - 阈值保护：当最优 Server 并发数超过理论均值 overflow_ratio 倍时，
+      退化为纯 active 最小选择，覆盖极端高负载场景
+    - 粘性会话稳定：不主动打破，KV Cache 收益优先
+
+    设计取舍：
+    - 未引入 EMA 响应时间：response 长度噪声导致信噪比不足以覆盖其带来的参数
+      调优负担和状态管理复杂度，待有充分实验数据后再评估是否引入
+    """
 
     def __init__(
         self,
@@ -214,29 +210,20 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
         server_handles: list[Any],
         *,
         max_cache_size: int = DEFAULT_MAX_CACHE_SIZE,
-        ema_decay: float = DEFAULT_EMA_DECAY,
-        rt_weight: float = DEFAULT_RT_WEIGHT,
         overflow_ratio: float = DEFAULT_OVERFLOW_RATIO,
-        idle_reset_threshold: float = DEFAULT_IDLE_RESET_THRESHOLD,
-        idle_decay_factor: float = DEFAULT_IDLE_DECAY_FACTOR,
     ) -> None:
 
         super().__init__(config, server_handles, max_cache_size=max_cache_size)
 
-        self.ema_decay = ema_decay
-        self.rt_weight = rt_weight
         self.overflow_ratio = overflow_ratio
         self.num_servers = len(server_handles)
-
-        self.idle_reset_threshold = idle_reset_threshold
-        self.idle_decay_factor = idle_decay_factor
 
         self.states: dict[int, ServerState] = {
             idx: ServerState(index=idx, actor=actor)
             for idx, actor in enumerate(self.server_handles)
         }
 
-        self._actor_to_idx = {
+        self._actor_to_idx: dict[Any, int] = {
             actor: idx for idx, actor in enumerate(self.server_handles)
         }
 
@@ -244,74 +231,44 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
 
         self._request_counter = 0
 
-        # idle detection
-        self._last_active_timestamp = time.monotonic()
-        self._ema_idle_reset_done = False
-
         print(
             f"[Balance Init] servers={self.num_servers}, "
-            f"ema_decay={ema_decay}, rt_weight={rt_weight}, "
-            f"overflow_ratio={overflow_ratio}, "
-            f"idle_reset_threshold={idle_reset_threshold}, "
-            f"idle_decay_factor={idle_decay_factor}"
+            f"overflow_ratio={overflow_ratio}"
         )
 
     # ==============================================
     # Internal Utilities
     # ==============================================
 
-    def _global_avg_rt(self) -> float:
-        return sum(s.ema_rt for s in self.states.values()) / max(self.num_servers, 1)
-
     def _theory_per_server(self) -> float:
+        """理论每 Server 均匀并发数 = 当前总 active / num_servers，动态计算。"""
         total = sum(s.active for s in self.states.values())
         return total / max(self.num_servers, 1)
-
-    def _total_active(self) -> int:
-        return sum(s.active for s in self.states.values())
-
-    # ==============================================
-    # Idle Reset Logic
-    # ==============================================
-
-    def _decay_ema_on_idle(self) -> None:
-        # 问题1修复：直接重置到 1.0，下一个 step 各 Server 完全均等
-        # idle_decay_factor=0.01 使得 ema_rt * 0.01 远小于 1.0，max(1.0, ...) 保证下限
-        for state in self.states.values():
-            state.ema_rt = max(1.0, state.ema_rt * self.idle_decay_factor)
-
-        print("[Balance] Idle detected → EMA decayed")
-
-    def _maybe_idle_reset(self) -> None:
-        # 此方法在 active 已经 +1 之后调用，total_active 必然 > 0
-        # 因此只需检查距上次归零的时间，不存在 active=0 的竞态窗口
-        idle_time = time.monotonic() - self._last_active_timestamp
-        if idle_time >= self.idle_reset_threshold and not self._ema_idle_reset_done:
-            self._decay_ema_on_idle()
-            self._ema_idle_reset_done = True
 
     # ==============================================
     # Scheduling Core
     # ==============================================
 
     def _best_state(self) -> ServerState:
-        global_avg = self._global_avg_rt()
+        """
+        选出 active 最小的 Server。
+
+        阈值保护：当最优 Server 的 active 超过理论均值的 overflow_ratio 倍时，
+        说明整体高负载，仍选 active 最小，保证可用性不低于原始方案。
+        （高负载下该逻辑与正常路径等价，保留是为了语义清晰和监控触发。）
+        """
         theory = self._theory_per_server()
         threshold = theory * self.overflow_ratio
 
-        best: Optional[ServerState] = None
-        best_score = float("inf")
-
-        for state in self.states.values():
-            score = state.load_score(global_avg, self.rt_weight)
-            if score < best_score:
-                best_score = score
-                best = state
-
-        assert best is not None
+        best = min(self.states.values(), key=lambda s: s.active)
 
         if best.active > threshold and theory > 0:
-            best = min(self.states.values(), key=lambda s: s.active)
+            # 显式记录触发，便于监控排查
+            if self._request_counter % LOG_INTERVAL == 0:
+                print(
+                    f"[Balance] Overflow triggered: "
+                    f"best.active={best.active}, threshold={threshold:.1f}"
+                )
 
         return best
 
@@ -320,24 +277,16 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     # ==============================================
 
     def _choose_server(self, request_id: str, prompt_ids=None) -> ServerState:
-
-        # 问题2修复：粘性会话保留原始方案逻辑，不主动打破，KV Cache 收益优先
+        # 粘性会话：不主动打破，KV Cache 收益优先
         if request_id in self.request_id_to_state:
             state = self.request_id_to_state[request_id]
             state.active += 1
-            # 问题3&4修复：active +1 之后再清除 flag，消除 active=0 的竞态窗口
-            self._ema_idle_reset_done = False
-            self._maybe_idle_reset()
             return state
 
         state = self._best_state()
         state.active += 1
         state.total_requests += 1
         self.request_id_to_state[request_id] = state
-
-        # 问题3&4修复：active +1 之后再清除 flag 并检测 idle reset
-        self._ema_idle_reset_done = False
-        self._maybe_idle_reset()
 
         self._request_counter += 1
         if self._request_counter % LOG_INTERVAL == 0:
@@ -348,12 +297,6 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     def _release(self, state: ServerState, response_time: float) -> None:
         state.active = max(0, state.active - 1)
         state.total_time += response_time
-        state.update_rt(response_time, self.ema_decay)
-
-        # 问题3修复：记录 active 归零的时间点，供 _maybe_idle_reset 计算 idle_time
-        # 只在归零时更新，避免被中间的 release 覆盖
-        if self._total_active() == 0:
-            self._last_active_timestamp = time.monotonic()
 
     # ==============================================
     # Public APIs
@@ -391,16 +334,14 @@ class FullyAsyncLLMServerManagerBalance(AsyncLLMServerManager):
     def get_load_metrics(self) -> dict[str, Any]:
         return {
             "active": {i: s.active for i, s in self.states.items()},
-            "ema_rt": {i: round(s.ema_rt, 3) for i, s in self.states.items()},
-            "global_avg_rt": round(self._global_avg_rt(), 3),
+            "total_requests": {i: s.total_requests for i, s in self.states.items()},
         }
 
     def _log_status(self) -> None:
         metrics = self.get_load_metrics()
         print(
             f"[Balance] active={metrics['active']} | "
-            f"ema_rt={metrics['ema_rt']} | "
-            f"global_avg_rt={metrics['global_avg_rt']}"
+            f"total_requests={metrics['total_requests']}"
         )
 
 
