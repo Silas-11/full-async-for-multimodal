@@ -409,7 +409,6 @@ class vLLMHttpServerBase:
             await self.run_server(server_args)
         else:
             await self.run_headless(server_args)
-
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
@@ -423,9 +422,9 @@ class vLLMHttpServerBase:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
-
-        # Don't keep the dummy data in memory
+        engine_client = AsyncLLM.from_vllm_config(
+            vllm_config=vllm_config, usage_context=usage_context, **kwargs
+        )
         await engine_client.reset_mm_cache()
 
         app = build_app(args)
@@ -433,12 +432,71 @@ class vLLMHttpServerBase:
             await init_app_state(engine_client, app.state, args)
         else:
             await init_app_state(engine_client, vllm_config, app.state, args)
+
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
+
+        # ── 在服务器启动前创建监控任务（避免被 run_unvicorn 阻塞）──
+        self._monitor_task = asyncio.create_task(self._monitor_loop(interval=60))
+
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
+
+    async def _monitor_loop(self, interval: int):
+        """后台监控循环，支持 CancelledError 优雅退出"""
+        # 等待引擎完全就绪后再开始监控
+        await asyncio.sleep(interval)
+        while True:
+            try:
+                await self._print_load_stats()
+            except asyncio.CancelledError:
+                logger.info("[LoadMonitor] stopped")
+                break
+            except Exception as e:
+                logger.warning(f"[LoadMonitor] error: {e}")
+            await asyncio.sleep(interval)
+
+
+    async def _print_load_stats(self):
+        request_states = self.engine.output_processor.request_states
+        active_requests = len(request_states)
+        max_seqs = self.config.max_num_seqs
+        concurrency_util = active_requests / max_seqs if max_seqs > 0 else 0.0
+
+        token_counts = []
+        for req_id, req_state in list(request_states.items()):
+            length = None
+            if hasattr(req_state, 'output_token_ids'):
+                length = len(req_state.output_token_ids)
+            elif hasattr(req_state, 'output_len'):
+                length = req_state.output_len
+            if length is not None:
+                token_counts.append(length)
+
+        kv_util_str = "N/A"
+        try:
+            if hasattr(self.engine.engine_core, 'get_kv_cache_usage_perc'):
+                kv_util = await self.engine.engine_core.get_kv_cache_usage_perc()
+                kv_util_str = f"{kv_util:.1%}"
+        except Exception:
+            pass
+
+        lines = [
+            f"\n{'='*50}",
+            f"[LoadMonitor] replica={self.replica_rank} node={self.node_rank}",
+            f"  active_requests : {active_requests} / {max_seqs}  ({concurrency_util:.1%})",
+            f"  kv_cache_util   : {kv_util_str}",
+        ]
+        if token_counts:
+            lines.append(
+                f"  token_counts    : min={min(token_counts)} "
+                f"max={max(token_counts)} "
+                f"avg={sum(token_counts)//len(token_counts)}"
+            )
+        lines.append(f"{'='*50}")
+        logger.info("\n".join(lines))
     async def run_headless(self, args: argparse.Namespace):
         # Create the EngineConfig.
         engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
