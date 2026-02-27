@@ -530,7 +530,8 @@ class vLLMHttpServerBase:
         lines.append(f"  kv_cache_util   : {kv_util_str}")
 
         lines.append(f"{'='*60}")
-        logger.info("\n".join(lines))
+        monitor_output = "\n".join(lines)
+        logger.info(f"[LOAD_MONITOR_OUTPUT]{monitor_output}")
 
     async def run_headless(self, args: argparse.Namespace):
         # Create the EngineConfig.
