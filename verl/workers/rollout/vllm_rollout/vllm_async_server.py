@@ -460,21 +460,66 @@ class vLLMHttpServerBase:
 
 
     async def _print_load_stats(self):
+        import time
+        
         request_states = self.engine.output_processor.request_states
         active_requests = len(request_states)
         max_seqs = self.config.max_num_seqs
         concurrency_util = active_requests / max_seqs if max_seqs > 0 else 0.0
 
+        # ── 采集每个请求的状态 ──
+        prefill_count = 0
         token_counts = []
-        for req_id, req_state in list(request_states.items()):
-            length = None
-            if hasattr(req_state, 'output_token_ids'):
-                length = len(req_state.output_token_ids)
-            elif hasattr(req_state, 'output_len'):
-                length = req_state.output_len
-            if length is not None:
-                token_counts.append(length)
+        wait_times = []
+        first_token_latencies = []
+        now = time.time()
 
+        for req_id, req_state in list(request_states.items()):
+            # prefill / decode 阶段统计
+            prefill_count += int(req_state.is_prefilling)
+
+            if req_state.stats is not None:
+                # 已生成 token 数
+                token_counts.append(req_state.stats.num_generation_tokens)
+                # 请求已等待时长（arrival_time 是 wall-clock）
+                wait_times.append(now - req_state.stats.arrival_time)
+                # TTFT（first_token_ts > 0 说明已经出过第一个 token）
+                if req_state.stats.first_token_latency > 0:
+                    first_token_latencies.append(req_state.stats.first_token_latency)
+
+        decode_count = active_requests - prefill_count
+
+        # ── 格式化输出 ──
+        lines = [
+            f"\n{'='*60}",
+            f"[LoadMonitor] replica={self.replica_rank}  node={self.node_rank}",
+            f"  active_requests : {active_requests} / {max_seqs}  ({concurrency_util:.1%})",
+            f"  phase           : prefill={prefill_count}  decode={decode_count}",
+        ]
+
+        if token_counts:
+            lines.append(
+                f"  gen_tokens      : min={min(token_counts)}  "
+                f"max={max(token_counts)}  "
+                f"avg={sum(token_counts) // len(token_counts)}  "
+                f"(long_tail>=4096: {sum(1 for t in token_counts if t >= 4096)})"
+            )
+
+        if wait_times:
+            lines.append(
+                f"  wait_time(s)    : min={min(wait_times):.1f}  "
+                f"max={max(wait_times):.1f}  "
+                f"avg={sum(wait_times) / len(wait_times):.1f}"
+            )
+
+        if first_token_latencies:
+            lines.append(
+                f"  ttft(s)         : min={min(first_token_latencies):.3f}  "
+                f"max={max(first_token_latencies):.3f}  "
+                f"avg={sum(first_token_latencies) / len(first_token_latencies):.3f}"
+            )
+
+        # ── KV Cache 使用率（可选） ──
         kv_util_str = "N/A"
         try:
             if hasattr(self.engine.engine_core, 'get_kv_cache_usage_perc'):
@@ -482,21 +527,11 @@ class vLLMHttpServerBase:
                 kv_util_str = f"{kv_util:.1%}"
         except Exception:
             pass
+        lines.append(f"  kv_cache_util   : {kv_util_str}")
 
-        lines = [
-            f"\n{'='*50}",
-            f"[LoadMonitor] replica={self.replica_rank} node={self.node_rank}",
-            f"  active_requests : {active_requests} / {max_seqs}  ({concurrency_util:.1%})",
-            f"  kv_cache_util   : {kv_util_str}",
-        ]
-        if token_counts:
-            lines.append(
-                f"  token_counts    : min={min(token_counts)} "
-                f"max={max(token_counts)} "
-                f"avg={sum(token_counts)//len(token_counts)}"
-            )
-        lines.append(f"{'='*50}")
+        lines.append(f"{'='*60}")
         logger.info("\n".join(lines))
+
     async def run_headless(self, args: argparse.Namespace):
         # Create the EngineConfig.
         engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
