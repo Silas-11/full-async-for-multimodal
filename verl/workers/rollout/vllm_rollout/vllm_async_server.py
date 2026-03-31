@@ -505,6 +505,19 @@ class vLLMHttpServerBase:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        # Block multimodal special tokens (image/video) from being sampled during RL rollout.
+        # If generated, these tokens get written into KV cache history and cause
+        # mask/embedding count mismatch in merge_multimodal_embeddings on the next request.
+        if hasattr(self.model_config, 'processor') and self.model_config.processor:
+            proc = self.model_config.processor
+            bad_words = sampling_params.get('bad_words', [])
+            for attr in ('image_token', 'video_token'):
+                # Skip if the processor does not expose this token attribute
+                token_str = getattr(proc, attr, None)
+                if token_str:
+                    bad_words = bad_words + [token_str]
+            if bad_words:
+                sampling_params['bad_words'] = bad_words
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
